@@ -80,7 +80,7 @@ td{padding:8px 10px;border-bottom:1px solid #21262d33}
 </div>
 <div class="report" id="rpt" style="display:none">
   <div class="header"><div><h1>⚡ Season 4 SUP Rewards</h1><div class="sub mono">GoodDollar Incentives · Base Mainnet · Dec 17 2025 → Feb 26 2026</div></div><div class="export-bar"><button class="bx" onclick="xPool()">⬇ Pool CSV</button><button class="bx" onclick="xPts()">⬇ Points CSV</button><button class="bx" onclick="xSum()">⬇ Summary</button></div></div>
-  <div class="banner" id="banner"><strong>ℹ️ Data Integration:</strong> Pool members (locker contracts) are mapped to user wallets via the reserve factory subgraph, then joined with Points API data. All data is fetched live.</div>
+  <div class="banner" id="banner"><strong>ℹ️ Loading data...</strong> Fetching pool distribution, points, and wallet mapping from multiple sources.</div>
   <div class="kg" id="k1"></div><div class="kg" id="k2"></div>
   <div id="actions-section"></div>
   <div class="cg" id="c1"></div>
@@ -207,20 +207,67 @@ async function go(){
 
     // Step 7: Wallet↔Locker mapping
     ms('s7','active');
+    let lkOk=false;
+    // Strategy 1: Load lockers.json from same directory (GitHub Pages / same origin)
     try{
-      let lid='';
-      while(true){
-        const r=await fetch(LSG,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:`{lockers(first:1000,where:{id_gt:"${lid}"},orderBy:id){id lockerOwner}}`})});
-        if(!r.ok) throw new Error('HTTP '+r.status);
+      const r=await fetch('lockers.json');
+      if(r.ok){
         const j=await r.json();
-        if(!j.data||!j.data.lockers||!j.data.lockers.length) break;
-        j.data.lockers.forEach(l=>{lockers[l.id.toLowerCase()]=l.lockerOwner.toLowerCase();});
+        const lks=j.data?j.data.lockers:(Array.isArray(j)?j:(j.lockers||[]));
+        lks.forEach(l=>{lockers[(l.id||'').toLowerCase()]=(l.lockerOwner||'').toLowerCase();});
         document.getElementById('s7').querySelector('.ico').textContent=Object.keys(lockers).length;
-        if(j.data.lockers.length<1000) break;
-        lid=j.data.lockers[j.data.lockers.length-1].id;
+        if(Object.keys(lockers).length>0) lkOk=true;
       }
-    }catch(e){/* locker mapping is enhancement, not critical */}
-    ms('s7','done');
+    }catch(e){}
+    // Strategy 2: Try subgraph directly (usually blocked by CORS)
+    if(!lkOk){
+      const lkQuery=(lid)=>JSON.stringify({query:`{lockers(first:1000,where:{id_gt:"${lid}"},orderBy:id){id lockerOwner}}`});
+      try{
+        lockers={};let lid='';
+        while(true){
+          const r=await fetch(LSG,{method:'POST',headers:{'Content-Type':'application/json'},body:lkQuery(lid)});
+          if(!r.ok) throw new Error('HTTP '+r.status);
+          const j=await r.json();
+          if(!j.data||!j.data.lockers||!j.data.lockers.length) break;
+          j.data.lockers.forEach(l=>{lockers[l.id.toLowerCase()]=l.lockerOwner.toLowerCase();});
+          document.getElementById('s7').querySelector('.ico').textContent=Object.keys(lockers).length;
+          if(j.data.lockers.length<1000) break;
+          lid=j.data.lockers[j.data.lockers.length-1].id;
+        }
+        if(Object.keys(lockers).length>0) lkOk=true;
+      }catch(e){}
+    }
+    // Strategy 3: File upload fallback
+    if(!lkOk){
+      ms('s7','fail');
+      document.getElementById('s7').innerHTML=`<span class="ico" style="color:var(--orange)">!</span> Locker data not found. Upload lockers.json or place it in the same folder:`;
+      const ud=document.createElement('div');
+      ud.style.cssText='margin:10px 0 0 30px';
+      ud.innerHTML=`<div style="font-size:11px;color:var(--textDim);margin-bottom:6px">Generate lockers.json with this PowerShell command, then upload or add to your GitHub repo:</div>
+        <pre style="background:var(--surface);padding:8px;border-radius:4px;font-size:9px;color:var(--orange);overflow:auto;margin-bottom:8px;max-height:70px;white-space:pre-wrap;word-break:break-all;user-select:all;cursor:text">$u="https://thegraph.com/explorer/api/playground/QmbmxtkSiFkKpHeUd4wKmws8QVkb7DtE2UMRtezC7HpmG1"; $all=@(); $lid=""; do{ $q=@{query="{lockers(first:1000,where:{id_gt:\\`"$lid\\`"},orderBy:id){id lockerOwner}}"}|ConvertTo-Json; $r=Invoke-RestMethod -Uri $u -Method POST -ContentType "application/json" -Body $q; $batch=$r.data.lockers; $all+=$batch; if($batch.Count -ge 1000){$lid=$batch[-1].id}else{break} }while($true); @{lockers=$all}|ConvertTo-Json -Depth 5|Out-File "$env:USERPROFILE\\Desktop\\lockers.json" -Encoding UTF8; Write-Host "Saved $($all.Count) lockers"</pre>
+        <label style="display:inline-flex;align-items:center;gap:6px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 16px;cursor:pointer;font-size:12px;color:var(--textDim)">
+          📁 Upload lockers.json
+          <input type="file" accept=".json" id="lk-upload" style="display:none">
+        </label>
+        <span id="lk-status" style="margin-left:8px;font-size:12px"></span>
+        <button onclick="document.getElementById('s7').innerHTML='<span class=ico style=color:var(--textMuted)>○</span> Skipped';ms('s7','done');document.getElementById('lk-skip-resolve')&&document.getElementById('lk-skip-resolve').click()" style="margin-left:8px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:6px 14px;font-size:12px;color:var(--textDim);cursor:pointer;font-family:'DM Sans'">Skip (continue without mapping)</button>
+        <button id="lk-skip-resolve" style="display:none"></button>`;
+      document.getElementById('steps').appendChild(ud);
+      await new Promise((resolve)=>{
+        document.getElementById('lk-skip-resolve').addEventListener('click',resolve);
+        document.getElementById('lk-upload').addEventListener('change',function(){
+          const f=this.files[0];if(!f)return;
+          const rd=new FileReader();
+          rd.onload=function(e){
+            try{const j=JSON.parse(e.target.result);
+            const lks=j.data?j.data.lockers:(Array.isArray(j)?j:(j.lockers||[]));
+            lks.forEach(l=>{lockers[(l.id||'').toLowerCase()]=(l.lockerOwner||'').toLowerCase();});
+            document.getElementById('lk-status').textContent='✓ '+Object.keys(lockers).length+' lockers';
+            document.getElementById('lk-status').style.color='var(--green)';ms('s7','done');resolve();}
+            catch(err){document.getElementById('lk-status').textContent='Error: '+err.message;document.getElementById('lk-status').style.color='var(--red)';}};
+          rd.readAsText(f);});
+      });
+    } else { ms('s7','done'); }
 
     document.getElementById('ov').classList.add('fade-out');
     setTimeout(()=>{document.getElementById('ov').style.display='none';document.getElementById('rpt').style.display='block';render();},600);
@@ -263,10 +310,21 @@ function render(){
   document.getElementById('k1').innerHTML=`
     <div class="k g"><div class="kl">Total Pool Funding</div><div class="kv">${f(tF)} SUP</div><div class="ku">${usd(tF)}</div><div class="ks">Season 4 allocation</div></div>
     <div class="k g"><div class="kl">Distributed to Members</div><div class="kv">${f(tS)} SUP</div><div class="ku">${usd(tS)}</div><div class="ks">${f(pr.length)} recipients</div></div>
-    <div class="k b"><div class="kl">Pool Members</div><div class="kv">${f(pr.length)}</div><div class="ks">${cn} connected · ${walletsMapped} wallets mapped</div></div>
-    <div class="k o"><div class="kl">Points Participants</div><div class="kv">${f(tr.length)}</div><div class="ks">${matched} matched to pool · ${wP} with pts &gt; 0</div></div>
+    <div class="k b"><div class="kl">Pool Members</div><div class="kv">${f(pr.length)}</div><div class="ks">${walletsMapped?f(walletsMapped)+' wallets resolved':'Locker→wallet mapping not loaded'}</div></div>
+    <div class="k o"><div class="kl">Points Participants</div><div class="kv">${f(tr.length)}</div><div class="ks">${wP} earned points from actions · ${tr.length-wP} registered but inactive</div></div>
     <div class="k p"><div class="kl">Total Points</div><div class="kv">${f(tP)}</div></div>`;
-  document.getElementById('k2').innerHTML=`
+  // Dynamic banner
+  const lkCount2=Object.keys(lockers).length;
+  if(matched>0){
+    document.getElementById('banner').innerHTML=`<strong>✅ Datasets Linked:</strong> ${f(lkCount2)} locker→wallet mappings loaded from <code style="font-size:11px;background:var(--surface2);padding:2px 4px;border-radius:3px">lockers.json</code>. <strong>${matched}</strong> of ${pr.length} pool members successfully matched to points data. The table below shows each user's wallet, their locker contract, SUP received, and points earned.`;
+    document.getElementById('banner').style.borderLeftColor='var(--green)';
+  }else if(lkCount2>0){
+    document.getElementById('banner').innerHTML=`<strong>⚠️ Partial mapping:</strong> ${f(lkCount2)} lockers loaded but only ${walletsMapped} of ${pr.length} pool members had a matching locker. This may mean the subgraph doesn't index all locker contracts used by this pool, or there are newer lockers. Try re-running <code style="font-size:11px;background:var(--surface2);padding:2px 4px;border-radius:3px">fetch_lockers.ps1</code> to update.`;
+    document.getElementById('banner').style.borderLeftColor='var(--orange)';
+  }else{
+    document.getElementById('banner').innerHTML=`<strong>📋 Setup Required:</strong> To link pool members to user wallets, add a <code style="font-size:11px;background:var(--surface2);padding:2px 4px;border-radius:3px">lockers.json</code> file to the same folder as this page. Run <code style="font-size:11px;background:var(--surface2);padding:2px 4px;border-radius:3px">fetch_lockers.ps1</code> to generate it. Without this file, pool members (locker addresses) and points (wallet addresses) are shown as separate datasets.`;
+    document.getElementById('banner').style.borderLeftColor='var(--accent)';
+  }
     <div class="k g"><div class="kl">Average Reward</div><div class="kv">${f(tS/pr.length,2)} SUP</div><div class="ku">${usd(tS/pr.length)}</div></div>
     <div class="k b"><div class="kl">Median Reward</div><div class="kv">${f(med,2)} SUP</div><div class="ku">${usd(med)}</div></div>
     <div class="k pk"><div class="kl">Top 10 Concentration</div><div class="kv">${f(t10/tS*100,1)}%</div><div class="ks">${f(t10)} SUP</div><div class="ku">${usd(t10)}</div></div>
@@ -283,7 +341,7 @@ function render(){
   bar('h2',pd.map(d=>d.l),pd.map(d=>d.c),'#58a6ff');
 
   // Charts row 2: timelines
-  document.getElementById('c2').innerHTML='<div class="cb"><div class="ct">Member Activity Timeline</div><div class="cs">Pool unit updates per day</div><canvas id="t1"></canvas></div><div class="cb"><div class="ct">Points Activity Timeline</div><div class="cs">Last activity date distribution</div><canvas id="t2"></canvas></div>';
+  document.getElementById('c2').innerHTML='<div class="cb"><div class="ct">Member Activity Timeline</div><div class="cs">Pool unit updates per day — shows when members joined or had units changed</div><canvas id="t1"></canvas></div><div class="cb"><div class="ct">Points Activity Timeline</div><div class="cs">Last activity per wallet by date. Spikes indicate batch processing events (e.g. bulk point reconciliation)</div><canvas id="t2"></canvas></div>';
   if(tl.length){const dm={};tl.forEach(e=>{const d=new Date(Number(e.timestamp)*1000).toISOString().slice(0,10);dm[d]=(dm[d]||0)+1;});const ds=Object.keys(dm).sort();line('t1',ds,ds.map(d=>dm[d]),'#3fb950');}
   else{const dm={};pr.forEach(r=>{const d=new Date(r.ts*1000).toISOString().slice(0,10);dm[d]=(dm[d]||0)+1;});const ds=Object.keys(dm).sort();line('t1',ds,ds.map(d=>dm[d]),'#3fb950');}
   const pm={};tr.forEach(r=>{if(r.l){const d=r.l.slice(0,10);pm[d]=(pm[d]||0)+1;}});const pds=Object.keys(pm).sort();line('t2',pds,pds.map(d=>pm[d]),'#58a6ff');
@@ -291,9 +349,10 @@ function render(){
   // Tables
   // Actions breakdown section
   const evNames={claimed:'Claiming G$',invites:'Inviting Users',streamed:'Streaming Donations'};
+  const evDescs={claimed:'Daily G$ claims from GoodDollar UBI',invites:'Referring new users to the ecosystem',streamed:'Streaming or one-time donations to GoodCollective'};
   const evColors={claimed:'var(--green)',invites:'var(--accent)',streamed:'var(--purple)'};
   const actTotal=Object.values(actions).reduce((s,a)=>s+(typeof a.points==='number'?a.points:0),0);
-  let actHTML='<div class="cg" style="margin-top:0"><div class="cb" style="grid-column:span 2"><div class="ct">Points by Action Type</div><div class="cs">What actions drove the most reward points? (Season 4 events: claimed, invites, streamed)</div>';
+  let actHTML='<div class="cg" style="margin-top:0"><div class="cb" style="grid-column:span 2"><div class="ct">Points by Action Type</div><div class="cs">Season 4 incentivized 3 actions. Users earned points from these actions, which determined their share of SUP rewards. Higher points = more pool units = more SUP.</div>';
   actHTML+='<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;margin-bottom:16px">';
   for(const ev of ['claimed','invites','streamed']){
     const a=actions[ev]||{points:'?'};
@@ -301,7 +360,8 @@ function render(){
     actHTML+=`<div style="background:var(--surface2);border-radius:8px;padding:14px;border-left:3px solid ${evColors[ev]}">
       <div style="font-size:10px;color:var(--textMuted);text-transform:uppercase;letter-spacing:1px;font-family:'JetBrains Mono',monospace;margin-bottom:4px">${evNames[ev]}</div>
       <div style="font-size:22px;font-weight:700;color:var(--white)">${typeof a.points==='number'?f(a.points):a.points} pts</div>
-      <div style="font-size:11px;color:var(--textDim);margin-top:2px">${pct} of total${a.totalEvents?' · '+f(a.totalEvents)+' events':''}</div></div>`;
+      <div style="font-size:11px;color:var(--textDim);margin-top:2px">${pct} of total${a.totalEvents?' · '+f(a.totalEvents)+' events':''}</div>
+      <div style="font-size:10px;color:var(--textMuted);margin-top:4px">${evDescs[ev]}</div></div>`;
   }
   actHTML+='</div>';
   // Pie chart for action split
@@ -315,10 +375,11 @@ function render(){
     new Chart(document.getElementById('actPie'),{type:'doughnut',data:{labels:aLabels,datasets:[{data:aData,backgroundColor:aColors,borderWidth:0}]},options:{responsive:true,plugins:{legend:{position:'bottom',labels:{color:'#8b949e',font:{size:11},padding:16}}}}});
   }
 
+  const maxSUP=pr.length?pr[0].s:1;
   let h='<div style="overflow-x:auto"><table><thead><tr><th>#</th><th>Wallet</th><th>Locker</th><th>SUP Received</th><th>Points</th><th>Units</th><th>Share</th></tr></thead><tbody>';
-  pr.slice(0,30).forEach((r,i)=>{h+=`<tr><td class="mono" style="color:var(--textMuted)">${i+1}</td><td class="mono" style="font-size:11px">${r.wallet?ad(r.wallet):'<span style="color:var(--textMuted);font-size:10px">unmapped</span>'}</td><td class="mono" style="font-size:11px">${ad(r.locker)}</td><td style="font-weight:600;color:var(--white)">${f(r.s,2)}<span style="display:block;font-size:10px;color:var(--textMuted);font-style:italic">${usd(r.s)}</span></td><td style="color:${r.pts>0?'var(--orange)':'var(--textMuted)'}">${r.pts>0?f(r.pts):'—'}</td><td style="color:var(--textDim)">${r.u}</td><td style="color:var(--textDim)">${f(r.s/tS*100,2)}%</td></tr>`;});
+  pr.slice(0,30).forEach((r,i)=>{const pct=Math.round(r.s/maxSUP*100);const sPct=r.s/tS*100;h+=`<tr><td class="mono" style="color:var(--textMuted)">${i+1}</td><td class="mono" style="font-size:11px">${r.wallet?ad(r.wallet):'<span style="color:var(--textMuted);font-size:10px">unmapped</span>'}</td><td class="mono" style="font-size:11px">${ad(r.locker)}</td><td style="font-weight:600;color:var(--white)">${f(r.s,2)}<span style="display:block;font-size:10px;color:var(--textMuted);font-style:italic">${usd(r.s)}</span><div style="margin-top:3px;height:3px;background:var(--border);border-radius:2px;width:100px"><div style="height:3px;background:var(--green);border-radius:2px;width:${pct}px"></div></div></td><td style="color:${r.pts>0?'var(--orange)':'var(--textMuted)'}">${r.pts>0?f(r.pts):'—'}</td><td style="color:var(--textDim)">${r.u}</td><td style="color:var(--textDim)">${f(sPct,2)}%<div style="margin-top:3px;height:3px;background:var(--border);border-radius:2px;width:60px"><div style="height:3px;background:var(--accent);border-radius:2px;width:${Math.round(sPct/5*60)}px"></div></div></td></tr>`;});
   h+='</tbody></table></div>';document.getElementById('tp').innerHTML=h;
-  document.getElementById('tc').textContent=`Top 30 of ${pr.length} · ${matched} matched to points`;
+  document.getElementById('tc').textContent=matched>0?`Top 30 of ${pr.length} · ${matched} linked to points data`:`Top 30 of ${pr.length} · Load lockers.json to see wallet↔points link`;
 
   let p='<div style="overflow-x:auto"><table><thead><tr><th>#</th><th>Wallet</th><th>Points</th><th>Events</th><th>Last Active</th></tr></thead><tbody>';
   tr.slice(0,30).forEach((r,i)=>{p+=`<tr><td class="mono" style="color:var(--textMuted)">${i+1}</td><td class="mono" style="font-size:11px">${ad(r.a)}</td><td style="font-weight:600;color:var(--orange)">${f(r.p)}</td><td style="color:var(--textDim)">${f(r.e)}</td><td class="mono" style="color:var(--textDim);font-size:11px">${r.l?r.l.slice(0,10):'—'}</td></tr>`;});
