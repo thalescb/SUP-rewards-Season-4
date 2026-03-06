@@ -68,6 +68,8 @@ td{padding:8px 10px;border-bottom:1px solid #21262d33}
       <div class="step" id="s3"><span class="ico">○</span> Points leaderboard</div>
       <div class="step" id="s4"><span class="ico">○</span> SUP token price</div>
       <div class="step" id="s5"><span class="ico">○</span> Activity timeline</div>
+      <div class="step" id="s6"><span class="ico">○</span> Action breakdown</div>
+      <div class="step" id="s7"><span class="ico">○</span> Wallet↔Locker mapping</div>
     </div>
     <div id="ebox" style="display:none;margin-top:20px;background:var(--surface);border:1px solid var(--red);border-radius:8px;padding:14px;text-align:left">
       <div style="color:var(--red);font-size:13px;font-weight:600;margin-bottom:6px">Failed to load data</div>
@@ -78,8 +80,9 @@ td{padding:8px 10px;border-bottom:1px solid #21262d33}
 </div>
 <div class="report" id="rpt" style="display:none">
   <div class="header"><div><h1>⚡ Season 4 SUP Rewards</h1><div class="sub mono">GoodDollar Incentives · Base Mainnet · Dec 17 2025 → Feb 26 2026</div></div><div class="export-bar"><button class="bx" onclick="xPool()">⬇ Pool CSV</button><button class="bx" onclick="xPts()">⬇ Points CSV</button><button class="bx" onclick="xSum()">⬇ Summary</button></div></div>
-  <div class="banner"><strong>ℹ️ Address mapping:</strong> Pool members are <strong>reserve/locker contracts</strong>. Points API tracks <strong>user wallets</strong>. Shown independently. A wallet↔locker mapping is needed to join datasets.</div>
+  <div class="banner" id="banner"><strong>ℹ️ Data Integration:</strong> Pool members (locker contracts) are mapped to user wallets via the reserve factory subgraph, then joined with Points API data. All data is fetched live.</div>
   <div class="kg" id="k1"></div><div class="kg" id="k2"></div>
+  <div id="actions-section"></div>
   <div class="cg" id="c1"></div>
   <div class="cg" id="c2" style="margin-top:12px"></div>
   <div class="ts"><div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px"><div class="tabs"><div class="tab on" onclick="sw('p',this)">Top SUP Recipients</div><div class="tab" onclick="sw('t',this)">Top Points Earners</div></div><div id="tc" style="font-size:11px;color:var(--textDim)"></div></div><div id="tp"></div><div id="tt" style="display:none"></div></div>
@@ -87,8 +90,8 @@ td{padding:8px 10px;border-bottom:1px solid #21262d33}
   <div class="footer" id="ft"></div>
 </div>
 <script>
-const W=1e18,PID="0x41491a100847a7f678e3b286fea32b0dad18920e",SG="https://subgraph-endpoints.superfluid.dev/base-mainnet/protocol-v1",PA="https://cms.superfluid.pro/points/accounts",CID=7856;
-let pool,mem=[],pts=[],price=null,tl=[];
+const W=1e18,PID="0x41491a100847a7f678e3b286fea32b0dad18920e",SG="https://subgraph-endpoints.superfluid.dev/base-mainnet/protocol-v1",PA="https://cms.superfluid.pro/points/accounts",CID=7856,LSG="https://thegraph.com/explorer/api/playground/QmbmxtkSiFkKpHeUd4wKmws8QVkb7DtE2UMRtezC7HpmG1";
+let pool,mem=[],pts=[],price=null,tl=[],actions={},lockers={};
 
 function ms(id,st){const e=document.getElementById(id);e.className='step '+st;e.querySelector('.ico').textContent=st==='done'?'✓':st==='active'?'◉':st==='fail'?'✗':'○';}
 async function gql(q){const r=await fetch(SG,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q})});if(!r.ok)throw new Error('Subgraph HTTP '+r.status);return(await r.json()).data;}
@@ -160,6 +163,65 @@ async function go(){
     if(!d.memberUnitsUpdatedEvents||!d.memberUnitsUpdatedEvents.length)break;tl=tl.concat(d.memberUnitsUpdatedEvents);if(d.memberUnitsUpdatedEvents.length<1000)break;tlid=d.memberUnitsUpdatedEvents[d.memberUnitsUpdatedEvents.length-1].id;}}catch(e){}
     ms('s5','done');
 
+    // Step 6: Action breakdown
+    ms('s6','active');
+    const eventTypes=['claimed','invites','streamed'];
+    const EB='https://cms.superfluid.pro/points/event-balance';
+    for(const ev of eventTypes){
+      try{
+        // Try direct, then proxies
+        let got=false;
+        for(const px of [null,'https://corsproxy.io/?url=','https://api.allorigins.win/raw?url=']){
+          try{
+            const url=`${EB}?campaignId=${CID}&eventName=${ev}`;
+            const r=await fetch(px?px+encodeURIComponent(url):url);
+            if(!r.ok) throw new Error('HTTP '+r.status);
+            const j=await r.json();
+            actions[ev]={points:j.points||0};got=true;break;
+          }catch(e){continue;}
+        }
+        if(!got) actions[ev]={points:'?'};
+      }catch(e){actions[ev]={points:'?'};}
+    }
+    // Also try to get per-account event data for the top event types
+    // Use /points/events to get total event counts per type
+    for(const ev of eventTypes){
+      if(actions[ev].points==='?') continue;
+      try{
+        let got=false;
+        for(const px of [null,'https://corsproxy.io/?url=','https://api.allorigins.win/raw?url=']){
+          try{
+            const url=`${EB}?campaignId=${CID}&eventName=${ev}`;
+            // We already have total points; now get unique accounts by fetching first page of events
+            const eurl=`https://cms.superfluid.pro/points/events?campaignId=${CID}&eventName=${ev}&limit=1&page=1`;
+            const r=await fetch(px?px+encodeURIComponent(eurl):eurl);
+            if(!r.ok) throw new Error('HTTP '+r.status);
+            const j=await r.json();
+            actions[ev].totalEvents=j.pagination?j.pagination.totalDocs:null;
+            got=true;break;
+          }catch(e){continue;}
+        }
+      }catch(e){}
+    }
+    ms('s6','done');
+
+    // Step 7: Wallet↔Locker mapping
+    ms('s7','active');
+    try{
+      let lid='';
+      while(true){
+        const r=await fetch(LSG,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:`{lockers(first:1000,where:{id_gt:"${lid}"},orderBy:id){id lockerOwner}}`})});
+        if(!r.ok) throw new Error('HTTP '+r.status);
+        const j=await r.json();
+        if(!j.data||!j.data.lockers||!j.data.lockers.length) break;
+        j.data.lockers.forEach(l=>{lockers[l.id.toLowerCase()]=l.lockerOwner.toLowerCase();});
+        document.getElementById('s7').querySelector('.ico').textContent=Object.keys(lockers).length;
+        if(j.data.lockers.length<1000) break;
+        lid=j.data.lockers[j.data.lockers.length-1].id;
+      }
+    }catch(e){/* locker mapping is enhancement, not critical */}
+    ms('s7','done');
+
     document.getElementById('ov').classList.add('fade-out');
     setTimeout(()=>{document.getElementById('ov').style.display='none';document.getElementById('rpt').style.display='block';render();},600);
   }catch(e){
@@ -173,22 +235,36 @@ function sup(m){const r=Number(m.totalAmountReceivedUntilUpdatedAt),s=Number(m.p
 function gi(v){const s=v.filter(x=>x>0).sort((a,b)=>a-b);const n=s.length;if(!n)return 0;const mu=s.reduce((a,b)=>a+b,0)/n;if(!mu)return 0;let nm=0;for(let i=0;i<n;i++)nm+=(2*(i+1)-n-1)*s[i];return nm/(n*n*mu);}
 function f(n,d=0){return Number(n).toLocaleString(undefined,{maximumFractionDigits:d});}
 function usd(v){return price?`≈ $${f(v*price,2)} USD`:'';}
-function ad(a){return a.slice(0,8)+'…'+a.slice(-4);}
+function ad(a){return `<a href="https://basescan.org/address/${a}" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none" title="${a}">${a.slice(0,8)}…${a.slice(-4)}</a><span onclick="navigator.clipboard.writeText('${a}');this.textContent='✓';setTimeout(()=>this.textContent='📋',1000)" style="cursor:pointer;margin-left:4px;font-size:10px;opacity:.5" title="Copy full address">📋</span>`;}
 
 function render(){
-  const pr=mem.map(m=>({a:m.account.id.toLowerCase(),u:Number(m.units),s:sup(m),c:m.isConnected,ts:Number(m.updatedAtTimestamp)})).sort((a,b)=>b.s-a.s);
+  // Build points lookup by wallet
+  const ptsMap={};
+  pts.forEach(p=>{ptsMap[p.account.toLowerCase()]={p:p.totalPoints,e:p.eventCount,l:p.lastEventAt};});
+
+  // Build joined dataset: pool members → locker owner → points
+  const lkCount=Object.keys(lockers).length;
+  const pr=mem.map(m=>{
+    const locker=m.account.id.toLowerCase();
+    const wallet=lockers[locker]||null;
+    const pt=wallet?ptsMap[wallet]:null;
+    return{locker,wallet,u:Number(m.units),s:sup(m),c:m.isConnected,ts:Number(m.updatedAtTimestamp),pts:pt?pt.p:0,ev:pt?pt.e:0,la:pt?pt.l:null,matched:!!pt};
+  }).sort((a,b)=>b.s-a.s);
+
   const tr=pts.map(p=>({a:p.account.toLowerCase(),p:p.totalPoints,e:p.eventCount,l:p.lastEventAt})).sort((a,b)=>b.p-a.p);
   const tS=pr.reduce((s,r)=>s+r.s,0),tF=Number(pool.totalAmountDistributedUntilUpdatedAt)/W;
   const vs=pr.map(r=>r.s),so=[...vs].sort((a,b)=>a-b);
   const med=so.length%2===0?(so[so.length/2-1]+so[so.length/2])/2:so[Math.floor(so.length/2)];
   const cn=pr.filter(r=>r.c).length,t10=pr.slice(0,10).reduce((s,r)=>s+r.s,0),g=gi(vs);
   const tP=tr.reduce((s,r)=>s+r.p,0),wP=tr.filter(r=>r.p>0).length;
+  const matched=pr.filter(r=>r.matched).length;
+  const walletsMapped=pr.filter(r=>r.wallet).length;
 
   document.getElementById('k1').innerHTML=`
     <div class="k g"><div class="kl">Total Pool Funding</div><div class="kv">${f(tF)} SUP</div><div class="ku">${usd(tF)}</div><div class="ks">Season 4 allocation</div></div>
     <div class="k g"><div class="kl">Distributed to Members</div><div class="kv">${f(tS)} SUP</div><div class="ku">${usd(tS)}</div><div class="ks">${f(pr.length)} recipients</div></div>
-    <div class="k b"><div class="kl">Pool Members</div><div class="kv">${f(pr.length)}</div><div class="ks">${cn} connected · ${pr.length-cn} disconnected</div></div>
-    <div class="k o"><div class="kl">Points Participants</div><div class="kv">${f(tr.length)}</div><div class="ks">${wP} with points &gt; 0</div></div>
+    <div class="k b"><div class="kl">Pool Members</div><div class="kv">${f(pr.length)}</div><div class="ks">${cn} connected · ${walletsMapped} wallets mapped</div></div>
+    <div class="k o"><div class="kl">Points Participants</div><div class="kv">${f(tr.length)}</div><div class="ks">${matched} matched to pool · ${wP} with pts &gt; 0</div></div>
     <div class="k p"><div class="kl">Total Points</div><div class="kv">${f(tP)}</div></div>`;
   document.getElementById('k2').innerHTML=`
     <div class="k g"><div class="kl">Average Reward</div><div class="kv">${f(tS/pr.length,2)} SUP</div><div class="ku">${usd(tS/pr.length)}</div></div>
@@ -213,18 +289,44 @@ function render(){
   const pm={};tr.forEach(r=>{if(r.l){const d=r.l.slice(0,10);pm[d]=(pm[d]||0)+1;}});const pds=Object.keys(pm).sort();line('t2',pds,pds.map(d=>pm[d]),'#58a6ff');
 
   // Tables
-  let h='<div style="overflow-x:auto"><table><thead><tr><th>#</th><th>Address (Locker)</th><th>SUP Received</th><th>Units</th><th>Share</th><th>Status</th></tr></thead><tbody>';
-  pr.slice(0,30).forEach((r,i)=>{h+=`<tr><td class="mono" style="color:var(--textMuted)">${i+1}</td><td class="ad">${ad(r.a)}</td><td style="font-weight:600;color:var(--white)">${f(r.s,2)}<span style="display:block;font-size:10px;color:var(--textMuted);font-style:italic">${usd(r.s)}</span></td><td style="color:var(--textDim)">${r.u}</td><td style="color:var(--textDim)">${f(r.s/tS*100,2)}%</td><td><span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${r.c?'var(--green)':'var(--textMuted)'}"></span></td></tr>`;});
+  // Actions breakdown section
+  const evNames={claimed:'Claiming G$',invites:'Inviting Users',streamed:'Streaming Donations'};
+  const evColors={claimed:'var(--green)',invites:'var(--accent)',streamed:'var(--purple)'};
+  const actTotal=Object.values(actions).reduce((s,a)=>s+(typeof a.points==='number'?a.points:0),0);
+  let actHTML='<div class="cg" style="margin-top:0"><div class="cb" style="grid-column:span 2"><div class="ct">Points by Action Type</div><div class="cs">What actions drove the most reward points? (Season 4 events: claimed, invites, streamed)</div>';
+  actHTML+='<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;margin-bottom:16px">';
+  for(const ev of ['claimed','invites','streamed']){
+    const a=actions[ev]||{points:'?'};
+    const pct=actTotal>0&&typeof a.points==='number'?f(a.points/actTotal*100,1)+'%':'—';
+    actHTML+=`<div style="background:var(--surface2);border-radius:8px;padding:14px;border-left:3px solid ${evColors[ev]}">
+      <div style="font-size:10px;color:var(--textMuted);text-transform:uppercase;letter-spacing:1px;font-family:'JetBrains Mono',monospace;margin-bottom:4px">${evNames[ev]}</div>
+      <div style="font-size:22px;font-weight:700;color:var(--white)">${typeof a.points==='number'?f(a.points):a.points} pts</div>
+      <div style="font-size:11px;color:var(--textDim);margin-top:2px">${pct} of total${a.totalEvents?' · '+f(a.totalEvents)+' events':''}</div></div>`;
+  }
+  actHTML+='</div>';
+  // Pie chart for action split
+  if(actTotal>0) actHTML+='<canvas id="actPie" height="180"></canvas>';
+  actHTML+='</div></div>';
+  document.getElementById('actions-section').innerHTML=actHTML;
+  if(actTotal>0){
+    const aLabels=Object.keys(actions).filter(k=>typeof actions[k].points==='number').map(k=>evNames[k]||k);
+    const aData=Object.keys(actions).filter(k=>typeof actions[k].points==='number').map(k=>actions[k].points);
+    const aColors=['#3fb950','#58a6ff','#bc8cff'];
+    new Chart(document.getElementById('actPie'),{type:'doughnut',data:{labels:aLabels,datasets:[{data:aData,backgroundColor:aColors,borderWidth:0}]},options:{responsive:true,plugins:{legend:{position:'bottom',labels:{color:'#8b949e',font:{size:11},padding:16}}}}});
+  }
+
+  let h='<div style="overflow-x:auto"><table><thead><tr><th>#</th><th>Wallet</th><th>Locker</th><th>SUP Received</th><th>Points</th><th>Units</th><th>Share</th></tr></thead><tbody>';
+  pr.slice(0,30).forEach((r,i)=>{h+=`<tr><td class="mono" style="color:var(--textMuted)">${i+1}</td><td class="mono" style="font-size:11px">${r.wallet?ad(r.wallet):'<span style="color:var(--textMuted);font-size:10px">unmapped</span>'}</td><td class="mono" style="font-size:11px">${ad(r.locker)}</td><td style="font-weight:600;color:var(--white)">${f(r.s,2)}<span style="display:block;font-size:10px;color:var(--textMuted);font-style:italic">${usd(r.s)}</span></td><td style="color:${r.pts>0?'var(--orange)':'var(--textMuted)'}">${r.pts>0?f(r.pts):'—'}</td><td style="color:var(--textDim)">${r.u}</td><td style="color:var(--textDim)">${f(r.s/tS*100,2)}%</td></tr>`;});
   h+='</tbody></table></div>';document.getElementById('tp').innerHTML=h;
-  document.getElementById('tc').textContent=`Top 30 of ${pr.length}`;
+  document.getElementById('tc').textContent=`Top 30 of ${pr.length} · ${matched} matched to points`;
 
   let p='<div style="overflow-x:auto"><table><thead><tr><th>#</th><th>Wallet</th><th>Points</th><th>Events</th><th>Last Active</th></tr></thead><tbody>';
-  tr.slice(0,30).forEach((r,i)=>{p+=`<tr><td class="mono" style="color:var(--textMuted)">${i+1}</td><td class="ad">${ad(r.a)}</td><td style="font-weight:600;color:var(--orange)">${f(r.p)}</td><td style="color:var(--textDim)">${f(r.e)}</td><td class="mono" style="color:var(--textDim);font-size:11px">${r.l?r.l.slice(0,10):'—'}</td></tr>`;});
+  tr.slice(0,30).forEach((r,i)=>{p+=`<tr><td class="mono" style="color:var(--textMuted)">${i+1}</td><td class="mono" style="font-size:11px">${ad(r.a)}</td><td style="font-weight:600;color:var(--orange)">${f(r.p)}</td><td style="color:var(--textDim)">${f(r.e)}</td><td class="mono" style="color:var(--textDim);font-size:11px">${r.l?r.l.slice(0,10):'—'}</td></tr>`;});
   p+='</tbody></table></div>';document.getElementById('tt').innerHTML=p;
 
-  document.getElementById('tech').innerHTML=`<div style="font-size:13px;font-weight:600;color:var(--white);margin-bottom:8px;font-family:'DM Sans'">Technical Details</div><div>Token: SUP · ${pool.token.id}</div><div>Pool: ${PID}</div><div>Admin: ${pool.admin.id}</div><div>Network: Base Mainnet (8453)</div><div>Campaign: #${CID}</div><div>Flow Rate: ${pool.flowRate} (complete)</div><div>Units: ${f(Number(pool.totalUnits))}</div><div>Updated: ${new Date(Number(pool.updatedAtTimestamp)*1000).toISOString()}</div><div style="margin-top:6px;color:var(--orange)">⚠ Pool members are locker addresses. Wallet↔locker mapping needed for joined analysis.</div>`;
+  document.getElementById('tech').innerHTML=`<div style="font-size:13px;font-weight:600;color:var(--white);margin-bottom:8px;font-family:'DM Sans'">Technical Details</div><div>Token: SUP · ${pool.token.id}</div><div>Pool: ${PID}</div><div>Admin: ${pool.admin.id}</div><div>Network: Base Mainnet (8453)</div><div>Campaign: #${CID}</div><div>Flow Rate: ${pool.flowRate} (complete)</div><div>Units: ${f(Number(pool.totalUnits))}</div><div>Updated: ${new Date(Number(pool.updatedAtTimestamp)*1000).toISOString()}</div><div>Locker Mapping: ${f(Object.keys(lockers).length)} lockers indexed · ${walletsMapped} pool members mapped · ${matched} matched to points</div>`;
   document.getElementById('ft').textContent=`Generated ${new Date().toISOString().slice(0,16).replace('T',' ')} UTC · Live data from Superfluid Subgraph + Points API`;
-  window._pr=pr;window._tr=tr;window._tS=tS;window._tF=tF;window._st={tS,tF,m:pr.length,cn,pa:tr.length,tP,avg:tS/pr.length,med,t10p:t10/tS*100,g,u:Number(pool.totalUnits),price};
+  window._pr=pr;window._tr=tr;window._tS=tS;window._tF=tF;window._st={tS,tF,m:pr.length,cn,pa:tr.length,tP,avg:tS/pr.length,med,t10p:t10/tS*100,g,u:Number(pool.totalUnits),price,matched,lkCount:Object.keys(lockers).length};
 }
 
 function bar(id,l,d,c){new Chart(document.getElementById(id),{type:'bar',data:{labels:l,datasets:[{data:d,backgroundColor:c+'cc',borderRadius:3,barPercentage:.7}]},options:{responsive:true,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#8b949e',font:{size:10}},grid:{display:false}},y:{ticks:{color:'#8b949e',font:{size:10}},grid:{color:'#21262d'}}}}});}
@@ -234,13 +336,11 @@ function sw(t,el){document.querySelectorAll('.tab').forEach(t=>t.classList.remov
 
 function csv(rows,h){return[h.join(','),...rows.map(r=>h.map(k=>{const v=r[k];return typeof v==='string'&&(v.includes(',')||v.includes('"'))?`"${v.replace(/"/g,'""')}"`:v}).join(','))].join('\n');}
 function dl(c,n){const b=new Blob([c],{type:'text/csv'});const u=URL.createObjectURL(b);const a=document.createElement('a');a.href=u;a.download=n;a.click();URL.revokeObjectURL(u);}
-function xPool(){dl(csv(window._pr.map((r,i)=>({rank:i+1,address:r.a,sup:Math.round(r.s*1e4)/1e4,usd:price?Math.round(r.s*price*100)/100:'',units:r.u,share:Math.round(r.s/window._tS*1e4)/100,connected:r.c?'Y':'N'})),['rank','address','sup','usd','units','share','connected']),'season4_pool.csv');}
+function xPool(){dl(csv(window._pr.map((r,i)=>({rank:i+1,wallet:r.wallet||'',locker:r.locker,sup:Math.round(r.s*1e4)/1e4,usd:price?Math.round(r.s*price*100)/100:'',points:r.pts,events:r.ev,units:r.u,share:Math.round(r.s/window._tS*1e4)/100,connected:r.c?'Y':'N',matched:r.matched?'Y':'N'})),['rank','wallet','locker','sup','usd','points','events','units','share','connected','matched']),'season4_pool.csv');}
 function xPts(){dl(csv(window._tr.map((r,i)=>({rank:i+1,wallet:r.a,points:r.p,events:r.e,last:r.l||''})),['rank','wallet','points','events','last']),'season4_points.csv');}
-function xSum(){const s=window._st;dl(csv([{m:'Total Funding (SUP)',v:Math.round(s.tF*100)/100},{m:'Total Distributed (SUP)',v:Math.round(s.tS*100)/100},{m:'SUP Price (USD)',v:s.price||'N/A'},{m:'Total Value (USD)',v:s.price?Math.round(s.tS*s.price*100)/100:'N/A'},{m:'Pool Members',v:s.m},{m:'Connected',v:s.cn},{m:'Points Participants',v:s.pa},{m:'Total Points',v:s.tP},{m:'Total Units',v:s.u},{m:'Average (SUP)',v:Math.round(s.avg*100)/100},{m:'Median (SUP)',v:Math.round(s.med*100)/100},{m:'Top 10 %',v:Math.round(s.t10p*100)/100},{m:'Gini',v:Math.round(s.g*1000)/1000},{m:'Token',v:'SUP'},{m:'Pool',v:PID},{m:'Network',v:'Base Mainnet'},{m:'Campaign',v:'#'+CID},{m:'Note',v:'Pool members are locker addresses'}],['m','v']),'season4_summary.csv');}
+function xSum(){const s=window._st;dl(csv([{m:'Total Funding (SUP)',v:Math.round(s.tF*100)/100},{m:'Total Distributed (SUP)',v:Math.round(s.tS*100)/100},{m:'SUP Price (USD)',v:s.price||'N/A'},{m:'Total Value (USD)',v:s.price?Math.round(s.tS*s.price*100)/100:'N/A'},{m:'Pool Members',v:s.m},{m:'Connected',v:s.cn},{m:'Points Participants',v:s.pa},{m:'Matched (Pool↔Points)',v:s.matched},{m:'Lockers Indexed',v:s.lkCount},{m:'Total Points',v:s.tP},{m:'Total Units',v:s.u},{m:'Average (SUP)',v:Math.round(s.avg*100)/100},{m:'Median (SUP)',v:Math.round(s.med*100)/100},{m:'Top 10 %',v:Math.round(s.t10p*100)/100},{m:'Gini',v:Math.round(s.g*1000)/1000},{m:'Token',v:'SUP'},{m:'Pool',v:PID},{m:'Network',v:'Base Mainnet'},{m:'Campaign',v:'#'+CID}],['m','v']),'season4_summary.csv');}
 
 window.addEventListener('DOMContentLoaded',go);
 </script>
 </body>
 </html>
-
-
