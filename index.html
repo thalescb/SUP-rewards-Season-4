@@ -243,8 +243,8 @@ async function go(){
       document.getElementById('s7').innerHTML=`<span class="ico" style="color:var(--orange)">!</span> Locker data not found. Upload lockers.json or place it in the same folder:`;
       const ud=document.createElement('div');
       ud.style.cssText='margin:10px 0 0 30px';
-      ud.innerHTML=`<div style="font-size:11px;color:var(--textDim);margin-bottom:6px">Generate lockers.json with this PowerShell command, then upload or add to your GitHub repo:</div>
-        <pre style="background:var(--surface);padding:8px;border-radius:4px;font-size:9px;color:var(--orange);overflow:auto;margin-bottom:8px;max-height:70px;white-space:pre-wrap;word-break:break-all;user-select:all;cursor:text">$u="https://thegraph.com/explorer/api/playground/QmbmxtkSiFkKpHeUd4wKmws8QVkb7DtE2UMRtezC7HpmG1"; $all=@(); $lid=""; do{ $q=@{query="{lockers(first:1000,where:{id_gt:\\`"$lid\\`"},orderBy:id){id lockerOwner}}"}|ConvertTo-Json; $r=Invoke-RestMethod -Uri $u -Method POST -ContentType "application/json" -Body $q; $batch=$r.data.lockers; $all+=$batch; if($batch.Count -ge 1000){$lid=$batch[-1].id}else{break} }while($true); @{lockers=$all}|ConvertTo-Json -Depth 5|Out-File "$env:USERPROFILE\\Desktop\\lockers.json" -Encoding UTF8; Write-Host "Saved $($all.Count) lockers"</pre>
+      ud.innerHTML=`<div style="font-size:11px;color:var(--textDim);margin-bottom:6px">Generate lockers.json with the fetch_lockers.ps1 script, then upload or add to your GitHub repo:</div>
+        <pre style="background:var(--surface);padding:8px;border-radius:4px;font-size:9px;color:var(--orange);overflow:auto;margin-bottom:8px;max-height:70px;white-space:pre-wrap;word-break:break-all;user-select:all;cursor:text">powershell -ExecutionPolicy Bypass -File fetch_lockers.ps1</pre>
         <label style="display:inline-flex;align-items:center;gap:6px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 16px;cursor:pointer;font-size:12px;color:var(--textDim)">
           📁 Upload lockers.json
           <input type="file" accept=".json" id="lk-upload" style="display:none">
