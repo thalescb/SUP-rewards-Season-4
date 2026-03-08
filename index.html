@@ -166,51 +166,65 @@ async function go(){
     // Step 6: Action breakdown - try multiple approaches
     ms('s6','active');
     const eventTypes=['claimed','invites','streamed'];
-    // Approach 1: Use /points/events endpoint to count events and sum points per type
+    // Approach 1: Try fetching events without eventName filter to discover what exists
+    let discoveredEvents=null;
+    for(const px of [null,'https://corsproxy.io/?url=','https://api.allorigins.win/raw?url=']){
+      try{
+        const url='https://cms.superfluid.pro/points/events?campaignId='+CID+'&limit=5&page=1';
+        const r=await fetch(px?px+encodeURIComponent(url):url);
+        if(!r.ok) continue;
+        discoveredEvents=await r.json();
+        console.log('Discovered events sample:',JSON.stringify(discoveredEvents).slice(0,1000));
+        break;
+      }catch(e){continue;}
+    }
+    // Approach 2: Aggregate per-event-type from accounts data (already loaded)
+    // Each account's points are aggregated - try to get event breakdown per account
+    // Use /points/accounts with eventName filter
     for(const ev of eventTypes){
       try{
         let got=false;
         for(const px of [null,'https://corsproxy.io/?url=','https://api.allorigins.win/raw?url=']){
           try{
-            // Get first page of events for this type to see totalDocs and sample data
-            const eurl=`https://cms.superfluid.pro/points/events?campaignId=${CID}&eventName=${ev}&limit=100&page=1`;
-            const r=await fetch(px?px+encodeURIComponent(eurl):eurl);
+            const url='https://cms.superfluid.pro/points/accounts?campaignId='+CID+'&eventName='+ev+'&limit=100&page=1&orderBy=totalPoints&order=desc';
+            const r=await fetch(px?px+encodeURIComponent(url):url);
             if(!r.ok) throw new Error('HTTP '+r.status);
             const j=await r.json();
-            console.log('Events response for '+ev+':', JSON.stringify(j).slice(0,500));
-            const evts=j.events||j.data||j.results||[];
-            const totalEvts=j.pagination?j.pagination.totalDocs:evts.length;
-            // Sum points from first page events
-            let pagePts=0;
-            evts.forEach(e=>{pagePts+=(e.points||e.totalPoints||e.value||0);});
-            // If we have pagination info, estimate total (rough: page avg × total pages)
+            console.log('Accounts by event '+ev+':',JSON.stringify(j).slice(0,500));
+            const accts=j.accounts||[];
+            const totalAccts=j.pagination?j.pagination.totalDocs:accts.length;
+            let pagePts=accts.reduce((s,a)=>s+(a.totalPoints||0),0);
+            // If more pages, estimate total
             let estTotal=pagePts;
             let estimated=false;
-            if(j.pagination&&j.pagination.totalDocs>evts.length&&evts.length>0){
-              estTotal=Math.round(pagePts/evts.length*j.pagination.totalDocs);
+            if(j.pagination&&j.pagination.totalDocs>accts.length&&accts.length>0){
+              estTotal=Math.round(pagePts/accts.length*j.pagination.totalDocs);
               estimated=true;
             }
-            actions[ev]={points:estTotal,totalEvents:totalEvts,estimated};
+            actions[ev]={points:estTotal,totalEvents:totalAccts,estimated};
             got=true;break;
           }catch(e){continue;}
         }
-        if(!got){
-          // Fallback: try event-balance endpoint
-          for(const px of [null,'https://corsproxy.io/?url=','https://api.allorigins.win/raw?url=']){
-            try{
-              const url=`https://cms.superfluid.pro/points/event-balance?campaignId=${CID}&eventName=${ev}`;
-              const r=await fetch(px?px+encodeURIComponent(url):url);
-              if(!r.ok) throw new Error('HTTP '+r.status);
-              const j=await r.json();
-              console.log('Event-balance response for '+ev+':', JSON.stringify(j).slice(0,500));
-              // Try various field names
-              const p=j.points||j.totalPoints||j.balance||j.total||(j.data&&(j.data.points||j.data.totalPoints||j.data.balance))||0;
-              actions[ev]={points:p};got=true;break;
-            }catch(e){continue;}
-          }
-        }
         if(!got) actions[ev]={points:'?'};
       }catch(e){actions[ev]={points:'?'};}
+    }
+    // Fallback: if all actions are 0 or ?, try event-balance endpoint
+    const allZero=eventTypes.every(ev=>actions[ev].points===0||actions[ev].points==='?');
+    if(allZero){
+      for(const ev of eventTypes){
+        for(const px of [null,'https://corsproxy.io/?url=','https://api.allorigins.win/raw?url=']){
+          try{
+            const url='https://cms.superfluid.pro/points/event-balance?campaignId='+CID+'&eventName='+ev;
+            const r=await fetch(px?px+encodeURIComponent(url):url);
+            if(!r.ok) continue;
+            const j=await r.json();
+            console.log('Event-balance for '+ev+':',JSON.stringify(j).slice(0,500));
+            const p=j.points||j.totalPoints||j.balance||j.total||0;
+            if(p>0) actions[ev]={points:p};
+            break;
+          }catch(e){continue;}
+        }
+      }
     }
     ms('s6','done');
 
@@ -298,45 +312,45 @@ function render(){
   const ptsMap={};
   pts.forEach(p=>{ptsMap[p.account.toLowerCase()]={p:p.totalPoints,e:p.eventCount,l:p.lastEventAt};});
 
-  // Build joined dataset: pool members → locker owner → points
+  // Build bidirectional locker maps
   const lkCount=Object.keys(lockers).length;
-  const pr=mem.map(m=>{
+  const ownerToLockers={};// wallet → [locker1, locker2, ...]
+  Object.entries(lockers).forEach(([lk,ow])=>{if(!ownerToLockers[ow])ownerToLockers[ow]=[];ownerToLockers[ow].push(lk);});
+
+  // Build pool member set for reverse lookup
+  const poolMemberSet=new Set(mem.map(m=>m.account.id.toLowerCase()));
+
+  // STRATEGY A (forward): pool_member → lockers[pool_member] → wallet → points
+  // STRATEGY B (reverse): for each points account → find their lockers → check if any are pool members
+  // Build reverse map: which points accounts have lockers in the pool?
+  const ptsToPoolMember={};// points_wallet → pool_member_locker
+  Object.keys(ptsMap).forEach(wallet=>{
+    const userLockers=ownerToLockers[wallet]||[];
+    const inPool=userLockers.find(l=>poolMemberSet.has(l));
+    if(inPool) ptsToPoolMember[wallet]=inPool;
+  });
+
+  // Build pool member → points using BOTH strategies
+  const poolMemberToPts={};// pool_member_locker → {wallet, pts}
+  // Forward: lockers map
+  mem.forEach(m=>{
     const locker=m.account.id.toLowerCase();
     const wallet=lockers[locker]||null;
-    const pt=wallet?ptsMap[wallet]:null;
+    if(wallet&&ptsMap[wallet]) poolMemberToPts[locker]={wallet,pts:ptsMap[wallet]};
+  });
+  // Reverse: if a points account owns a locker that's a pool member
+  Object.entries(ptsToPoolMember).forEach(([wallet,locker])=>{
+    if(!poolMemberToPts[locker]) poolMemberToPts[locker]={wallet,pts:ptsMap[wallet]};
+  });
+
+  const pr=mem.map(m=>{
+    const locker=m.account.id.toLowerCase();
+    const fwd=lockers[locker]||null;// forward wallet from lockers map
+    const join=poolMemberToPts[locker]||null;
+    const wallet=join?join.wallet:fwd;
+    const pt=join?join.pts:null;
     return{locker,wallet,u:Number(m.units),s:sup(m),c:m.isConnected,ts:Number(m.updatedAtTimestamp),pts:pt?pt.p:0,ev:pt?pt.e:0,la:pt?pt.l:null,matched:!!pt};
   }).sort((a,b)=>b.s-a.s);
-
-  // Diagnostic: log match statistics
-  const resolvedWallets=pr.filter(r=>r.wallet).map(r=>r.wallet);
-  const ptsAccounts=Object.keys(ptsMap);
-  const resolvedSet=new Set(resolvedWallets);
-  const ptsSet=new Set(ptsAccounts);
-  const overlap=[...resolvedSet].filter(w=>ptsSet.has(w));
-  console.log('=== MATCH DIAGNOSTICS ===');
-  console.log('Pool members:',pr.length);
-  console.log('Resolved wallets (locker→owner):',resolvedWallets.length);
-  console.log('Unique resolved wallets:',resolvedSet.size);
-  console.log('Points accounts:',ptsAccounts.length);
-  console.log('Overlap (matched):',overlap.length);
-  console.log('Sample resolved wallets (first 5):',resolvedWallets.slice(0,5));
-  console.log('Sample points accounts (first 5):',ptsAccounts.slice(0,5));
-  // Show unmatched resolved wallets vs unmatched points accounts
-  const unmatchedWallets=[...resolvedSet].filter(w=>!ptsSet.has(w)).slice(0,5);
-  const unmatchedPts=ptsAccounts.filter(a=>!resolvedSet.has(a)).slice(0,5);
-  console.log('Sample unmatched resolved wallets:',unmatchedWallets);
-  console.log('Sample unmatched points accounts:',unmatchedPts);
-  console.log('Points accounts NOT in resolved wallets:',ptsAccounts.filter(a=>!resolvedSet.has(a)).length,'of',ptsAccounts.length);
-  // Check if points accounts might BE locker addresses (reverse lookup)
-  const lockerSet=new Set(Object.keys(lockers));
-  const ptsAsLockers=ptsAccounts.filter(a=>lockerSet.has(a));
-  console.log('Points accounts that ARE locker addresses:',ptsAsLockers.length);
-  // Check if points accounts are locker OWNERS via reverse map
-  const ownerToLocker={};
-  Object.entries(lockers).forEach(([lk,ow])=>{if(!ownerToLocker[ow])ownerToLocker[ow]=[];ownerToLocker[ow].push(lk);});
-  const ptsWithLockers=ptsAccounts.filter(a=>ownerToLocker[a]);
-  console.log('Points accounts that own a locker:',ptsWithLockers.length);
-  console.log('========================');
 
   const tr=pts.map(p=>({a:p.account.toLowerCase(),p:p.totalPoints,e:p.eventCount,l:p.lastEventAt})).sort((a,b)=>b.p-a.p);
   const tS=pr.reduce((s,r)=>s+r.s,0),tF=Number(pool.totalAmountDistributedUntilUpdatedAt)/W;
@@ -346,6 +360,28 @@ function render(){
   const tP=tr.reduce((s,r)=>s+r.p,0),wP=tr.filter(r=>r.p>0).length;
   const matched=pr.filter(r=>r.matched).length;
   const walletsMapped=pr.filter(r=>r.wallet).length;
+
+  // Diagnostics
+  const fwdMatches=mem.filter(m=>{const w=lockers[m.account.id.toLowerCase()];return w&&ptsMap[w];}).length;
+  const revMatches=Object.keys(ptsToPoolMember).length;
+  const ptsAccounts=Object.keys(ptsMap);
+  const resolvedWallets=pr.filter(r=>r.wallet).map(r=>r.wallet);
+  const resolvedSet=new Set(resolvedWallets);
+  const ptsSet=new Set(ptsAccounts);
+  const lockerSet=new Set(Object.keys(lockers));
+  const ptsAsLockers=ptsAccounts.filter(a=>lockerSet.has(a));
+  const ptsWithLockers=ptsAccounts.filter(a=>ownerToLockers[a]);
+  const ptsWithPoolLockers=Object.keys(ptsToPoolMember).length;
+  const overlap=[...resolvedSet].filter(w=>ptsSet.has(w));
+  const unmatchedWallets=[...resolvedSet].filter(w=>!ptsSet.has(w)).slice(0,3);
+  const unmatchedPts=ptsAccounts.filter(a=>!resolvedSet.has(a)).slice(0,3);
+  console.log('=== MATCH DIAGNOSTICS ===');
+  console.log('Forward matches (pool→locker→wallet→pts):',fwdMatches);
+  console.log('Reverse matches (pts→lockers→pool):',revMatches);
+  console.log('Combined unique matches:',matched);
+  console.log('Pts accounts owning lockers:',ptsWithLockers.length);
+  console.log('Pts accounts with lockers IN pool:',ptsWithPoolLockers);
+  console.log('========================');
 
   document.getElementById('k1').innerHTML=`
     <div class="k g"><div class="kl">Total Pool Funding</div><div class="kv">${f(tF)} SUP</div><div class="ku">${usd(tF)}</div><div class="ks">Season 4 allocation</div></div>
@@ -427,7 +463,7 @@ function render(){
   tr.slice(0,30).forEach((r,i)=>{const pPct=Math.round(r.p/maxPts*100);p+=`<tr><td class="mono" style="color:var(--textMuted)">${i+1}</td><td class="mono" style="font-size:11px">${ad(r.a)}</td><td style="font-weight:600;color:var(--orange)">${f(r.p)}<div style="margin-top:3px;height:3px;background:var(--border);border-radius:2px;width:100px"><div style="height:3px;background:var(--orange);border-radius:2px;width:${pPct}px"></div></div></td><td style="color:var(--textDim)">${f(r.e)}</td><td class="mono" style="color:var(--textDim);font-size:11px">${r.l?r.l.slice(0,10):'—'}</td></tr>`;});
   p+='</tbody></table></div>';document.getElementById('tt').innerHTML=p;
 
-  document.getElementById('tech').innerHTML=`<div style="font-size:13px;font-weight:600;color:var(--white);margin-bottom:8px;font-family:'DM Sans'">Technical Details</div><div>Token: SUP · ${pool.token.id}</div><div>Pool: ${PID}</div><div>Admin: ${pool.admin.id}</div><div>Network: Base Mainnet (8453)</div><div>Campaign: #${CID}</div><div>Flow Rate: ${pool.flowRate} (complete)</div><div>Units: ${f(Number(pool.totalUnits))}</div><div>Updated: ${new Date(Number(pool.updatedAtTimestamp)*1000).toISOString()}</div><div>Locker Mapping: ${f(Object.keys(lockers).length)} lockers indexed · ${walletsMapped} pool members mapped · ${matched} matched to points</div><div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)"><div style="font-size:12px;font-weight:600;color:var(--orange);margin-bottom:6px;font-family:'DM Sans'">Match Diagnostics</div><div>Unique resolved wallets: ${resolvedSet.size}</div><div>Points accounts: ${ptsAccounts.length}</div><div>Overlap (matched): ${overlap.length}</div><div>Points accounts NOT in resolved wallets: ${ptsAccounts.filter(a=>!resolvedSet.has(a)).length} of ${ptsAccounts.length}</div><div>Points accounts that ARE locker addresses: ${ptsAsLockers.length}</div><div>Points accounts that own a locker: ${ptsWithLockers.length}</div><div style="margin-top:6px">Sample resolved wallet: ${resolvedWallets[0]||'none'}</div><div>Sample points account: ${ptsAccounts[0]||'none'}</div><div style="margin-top:6px">Unmatched resolved (5): ${unmatchedWallets.join(', ')||'none'}</div><div>Unmatched points (5): ${unmatchedPts.join(', ')||'none'}</div><div style="margin-top:6px">Action data: ${JSON.stringify(actions)}</div></div>`;
+  document.getElementById('tech').innerHTML=`<div style="font-size:13px;font-weight:600;color:var(--white);margin-bottom:8px;font-family:'DM Sans'">Technical Details</div><div>Token: SUP · ${pool.token.id}</div><div>Pool: ${PID}</div><div>Admin: ${pool.admin.id}</div><div>Network: Base Mainnet (8453)</div><div>Campaign: #${CID}</div><div>Flow Rate: ${pool.flowRate} (complete)</div><div>Units: ${f(Number(pool.totalUnits))}</div><div>Updated: ${new Date(Number(pool.updatedAtTimestamp)*1000).toISOString()}</div><div>Locker Mapping: ${f(lkCount)} lockers indexed · ${walletsMapped} pool members mapped · ${matched} matched to points</div><div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)"><div style="font-size:12px;font-weight:600;color:var(--orange);margin-bottom:6px;font-family:'DM Sans'">Match Diagnostics</div><div>Forward join (pool→locker→wallet→pts): ${fwdMatches}</div><div>Reverse join (pts→lockers→pool): ${revMatches}</div><div>Combined matched: ${matched}</div><div>Points accounts owning lockers: ${ptsWithLockers.length} of ${ptsAccounts.length}</div><div>Pts accounts with lockers IN pool: ${ptsWithPoolLockers}</div><div style="margin-top:6px">Sample resolved wallet: ${resolvedWallets[0]||'none'}</div><div>Sample points account: ${ptsAccounts[0]||'none'}</div><div>Unmatched resolved (3): ${unmatchedWallets.join(', ')||'none'}</div><div>Unmatched points (3): ${unmatchedPts.join(', ')||'none'}</div><div style="margin-top:6px">Action data: ${JSON.stringify(actions)}</div></div>`;
   document.getElementById('ft').textContent=`Generated ${new Date().toISOString().slice(0,16).replace('T',' ')} UTC · Live data from Superfluid Subgraph + Points API`;
   window._pr=pr;window._tr=tr;window._tS=tS;window._tF=tF;window._st={tS,tF,m:pr.length,cn,pa:tr.length,tP,avg:tS/pr.length,med,t10p:t10/tS*100,g,u:Number(pool.totalUnits),price,matched,lkCount:Object.keys(lockers).length};
 }
