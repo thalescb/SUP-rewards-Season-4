@@ -163,45 +163,54 @@ async function go(){
     if(!d.memberUnitsUpdatedEvents||!d.memberUnitsUpdatedEvents.length)break;tl=tl.concat(d.memberUnitsUpdatedEvents);if(d.memberUnitsUpdatedEvents.length<1000)break;tlid=d.memberUnitsUpdatedEvents[d.memberUnitsUpdatedEvents.length-1].id;}}catch(e){}
     ms('s5','done');
 
-    // Step 6: Action breakdown
+    // Step 6: Action breakdown - try multiple approaches
     ms('s6','active');
     const eventTypes=['claimed','invites','streamed'];
-    const EB='https://cms.superfluid.pro/points/event-balance';
+    // Approach 1: Use /points/events endpoint to count events and sum points per type
     for(const ev of eventTypes){
-      try{
-        // Try direct, then proxies
-        let got=false;
-        for(const px of [null,'https://corsproxy.io/?url=','https://api.allorigins.win/raw?url=']){
-          try{
-            const url=`${EB}?campaignId=${CID}&eventName=${ev}`;
-            const r=await fetch(px?px+encodeURIComponent(url):url);
-            if(!r.ok) throw new Error('HTTP '+r.status);
-            const j=await r.json();
-            actions[ev]={points:j.points||0};got=true;break;
-          }catch(e){continue;}
-        }
-        if(!got) actions[ev]={points:'?'};
-      }catch(e){actions[ev]={points:'?'};}
-    }
-    // Also try to get per-account event data for the top event types
-    // Use /points/events to get total event counts per type
-    for(const ev of eventTypes){
-      if(actions[ev].points==='?') continue;
       try{
         let got=false;
         for(const px of [null,'https://corsproxy.io/?url=','https://api.allorigins.win/raw?url=']){
           try{
-            const url=`${EB}?campaignId=${CID}&eventName=${ev}`;
-            // We already have total points; now get unique accounts by fetching first page of events
-            const eurl=`https://cms.superfluid.pro/points/events?campaignId=${CID}&eventName=${ev}&limit=1&page=1`;
+            // Get first page of events for this type to see totalDocs and sample data
+            const eurl=`https://cms.superfluid.pro/points/events?campaignId=${CID}&eventName=${ev}&limit=100&page=1`;
             const r=await fetch(px?px+encodeURIComponent(eurl):eurl);
             if(!r.ok) throw new Error('HTTP '+r.status);
             const j=await r.json();
-            actions[ev].totalEvents=j.pagination?j.pagination.totalDocs:null;
+            console.log('Events response for '+ev+':', JSON.stringify(j).slice(0,500));
+            const evts=j.events||j.data||j.results||[];
+            const totalEvts=j.pagination?j.pagination.totalDocs:evts.length;
+            // Sum points from first page events
+            let pagePts=0;
+            evts.forEach(e=>{pagePts+=(e.points||e.totalPoints||e.value||0);});
+            // If we have pagination info, estimate total (rough: page avg × total pages)
+            let estTotal=pagePts;
+            let estimated=false;
+            if(j.pagination&&j.pagination.totalDocs>evts.length&&evts.length>0){
+              estTotal=Math.round(pagePts/evts.length*j.pagination.totalDocs);
+              estimated=true;
+            }
+            actions[ev]={points:estTotal,totalEvents:totalEvts,estimated};
             got=true;break;
           }catch(e){continue;}
         }
-      }catch(e){}
+        if(!got){
+          // Fallback: try event-balance endpoint
+          for(const px of [null,'https://corsproxy.io/?url=','https://api.allorigins.win/raw?url=']){
+            try{
+              const url=`https://cms.superfluid.pro/points/event-balance?campaignId=${CID}&eventName=${ev}`;
+              const r=await fetch(px?px+encodeURIComponent(url):url);
+              if(!r.ok) throw new Error('HTTP '+r.status);
+              const j=await r.json();
+              console.log('Event-balance response for '+ev+':', JSON.stringify(j).slice(0,500));
+              // Try various field names
+              const p=j.points||j.totalPoints||j.balance||j.total||(j.data&&(j.data.points||j.data.totalPoints||j.data.balance))||0;
+              actions[ev]={points:p};got=true;break;
+            }catch(e){continue;}
+          }
+        }
+        if(!got) actions[ev]={points:'?'};
+      }catch(e){actions[ev]={points:'?'};}
     }
     ms('s6','done');
 
@@ -298,6 +307,37 @@ function render(){
     return{locker,wallet,u:Number(m.units),s:sup(m),c:m.isConnected,ts:Number(m.updatedAtTimestamp),pts:pt?pt.p:0,ev:pt?pt.e:0,la:pt?pt.l:null,matched:!!pt};
   }).sort((a,b)=>b.s-a.s);
 
+  // Diagnostic: log match statistics
+  const resolvedWallets=pr.filter(r=>r.wallet).map(r=>r.wallet);
+  const ptsAccounts=Object.keys(ptsMap);
+  const resolvedSet=new Set(resolvedWallets);
+  const ptsSet=new Set(ptsAccounts);
+  const overlap=[...resolvedSet].filter(w=>ptsSet.has(w));
+  console.log('=== MATCH DIAGNOSTICS ===');
+  console.log('Pool members:',pr.length);
+  console.log('Resolved wallets (locker→owner):',resolvedWallets.length);
+  console.log('Unique resolved wallets:',resolvedSet.size);
+  console.log('Points accounts:',ptsAccounts.length);
+  console.log('Overlap (matched):',overlap.length);
+  console.log('Sample resolved wallets (first 5):',resolvedWallets.slice(0,5));
+  console.log('Sample points accounts (first 5):',ptsAccounts.slice(0,5));
+  // Show unmatched resolved wallets vs unmatched points accounts
+  const unmatchedWallets=[...resolvedSet].filter(w=>!ptsSet.has(w)).slice(0,5);
+  const unmatchedPts=ptsAccounts.filter(a=>!resolvedSet.has(a)).slice(0,5);
+  console.log('Sample unmatched resolved wallets:',unmatchedWallets);
+  console.log('Sample unmatched points accounts:',unmatchedPts);
+  console.log('Points accounts NOT in resolved wallets:',ptsAccounts.filter(a=>!resolvedSet.has(a)).length,'of',ptsAccounts.length);
+  // Check if points accounts might BE locker addresses (reverse lookup)
+  const lockerSet=new Set(Object.keys(lockers));
+  const ptsAsLockers=ptsAccounts.filter(a=>lockerSet.has(a));
+  console.log('Points accounts that ARE locker addresses:',ptsAsLockers.length);
+  // Check if points accounts are locker OWNERS via reverse map
+  const ownerToLocker={};
+  Object.entries(lockers).forEach(([lk,ow])=>{if(!ownerToLocker[ow])ownerToLocker[ow]=[];ownerToLocker[ow].push(lk);});
+  const ptsWithLockers=ptsAccounts.filter(a=>ownerToLocker[a]);
+  console.log('Points accounts that own a locker:',ptsWithLockers.length);
+  console.log('========================');
+
   const tr=pts.map(p=>({a:p.account.toLowerCase(),p:p.totalPoints,e:p.eventCount,l:p.lastEventAt})).sort((a,b)=>b.p-a.p);
   const tS=pr.reduce((s,r)=>s+r.s,0),tF=Number(pool.totalAmountDistributedUntilUpdatedAt)/W;
   const vs=pr.map(r=>r.s),so=[...vs].sort((a,b)=>a-b);
@@ -360,7 +400,7 @@ function render(){
     const pct=actTotal>0&&typeof a.points==='number'?f(a.points/actTotal*100,1)+'%':'—';
     actHTML+=`<div style="background:var(--surface2);border-radius:8px;padding:14px;border-left:3px solid ${evColors[ev]}">
       <div style="font-size:10px;color:var(--textMuted);text-transform:uppercase;letter-spacing:1px;font-family:'JetBrains Mono',monospace;margin-bottom:4px">${evNames[ev]}</div>
-      <div style="font-size:22px;font-weight:700;color:var(--white)">${typeof a.points==='number'?f(a.points):a.points} pts</div>
+      <div style="font-size:22px;font-weight:700;color:var(--white)">${typeof a.points==='number'&&a.points>0?f(a.points)+(a.estimated?' (est.)':''):typeof a.points==='number'?'0':'N/A'} pts</div>
       <div style="font-size:11px;color:var(--textDim);margin-top:2px">${pct} of total${a.totalEvents?' · '+f(a.totalEvents)+' events':''}</div>
       <div style="font-size:10px;color:var(--textMuted);margin-top:4px">${evDescs[ev]}</div></div>`;
   }
@@ -382,11 +422,12 @@ function render(){
   h+='</tbody></table></div>';document.getElementById('tp').innerHTML=h;
   document.getElementById('tc').textContent=matched>0?`Top 30 of ${pr.length} · ${matched} linked to points data`:`Top 30 of ${pr.length} · Load lockers.json to see wallet↔points link`;
 
+  const maxPts=tr.length?tr[0].p:1;
   let p='<div style="overflow-x:auto"><table><thead><tr><th>#</th><th>Wallet</th><th>Points</th><th>Events</th><th>Last Active</th></tr></thead><tbody>';
-  tr.slice(0,30).forEach((r,i)=>{p+=`<tr><td class="mono" style="color:var(--textMuted)">${i+1}</td><td class="mono" style="font-size:11px">${ad(r.a)}</td><td style="font-weight:600;color:var(--orange)">${f(r.p)}</td><td style="color:var(--textDim)">${f(r.e)}</td><td class="mono" style="color:var(--textDim);font-size:11px">${r.l?r.l.slice(0,10):'—'}</td></tr>`;});
+  tr.slice(0,30).forEach((r,i)=>{const pPct=Math.round(r.p/maxPts*100);p+=`<tr><td class="mono" style="color:var(--textMuted)">${i+1}</td><td class="mono" style="font-size:11px">${ad(r.a)}</td><td style="font-weight:600;color:var(--orange)">${f(r.p)}<div style="margin-top:3px;height:3px;background:var(--border);border-radius:2px;width:100px"><div style="height:3px;background:var(--orange);border-radius:2px;width:${pPct}px"></div></div></td><td style="color:var(--textDim)">${f(r.e)}</td><td class="mono" style="color:var(--textDim);font-size:11px">${r.l?r.l.slice(0,10):'—'}</td></tr>`;});
   p+='</tbody></table></div>';document.getElementById('tt').innerHTML=p;
 
-  document.getElementById('tech').innerHTML=`<div style="font-size:13px;font-weight:600;color:var(--white);margin-bottom:8px;font-family:'DM Sans'">Technical Details</div><div>Token: SUP · ${pool.token.id}</div><div>Pool: ${PID}</div><div>Admin: ${pool.admin.id}</div><div>Network: Base Mainnet (8453)</div><div>Campaign: #${CID}</div><div>Flow Rate: ${pool.flowRate} (complete)</div><div>Units: ${f(Number(pool.totalUnits))}</div><div>Updated: ${new Date(Number(pool.updatedAtTimestamp)*1000).toISOString()}</div><div>Locker Mapping: ${f(Object.keys(lockers).length)} lockers indexed · ${walletsMapped} pool members mapped · ${matched} matched to points</div>`;
+  document.getElementById('tech').innerHTML=`<div style="font-size:13px;font-weight:600;color:var(--white);margin-bottom:8px;font-family:'DM Sans'">Technical Details</div><div>Token: SUP · ${pool.token.id}</div><div>Pool: ${PID}</div><div>Admin: ${pool.admin.id}</div><div>Network: Base Mainnet (8453)</div><div>Campaign: #${CID}</div><div>Flow Rate: ${pool.flowRate} (complete)</div><div>Units: ${f(Number(pool.totalUnits))}</div><div>Updated: ${new Date(Number(pool.updatedAtTimestamp)*1000).toISOString()}</div><div>Locker Mapping: ${f(Object.keys(lockers).length)} lockers indexed · ${walletsMapped} pool members mapped · ${matched} matched to points</div><div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)"><div style="font-size:12px;font-weight:600;color:var(--orange);margin-bottom:6px;font-family:'DM Sans'">Match Diagnostics</div><div>Unique resolved wallets: ${resolvedSet.size}</div><div>Points accounts: ${ptsAccounts.length}</div><div>Overlap (matched): ${overlap.length}</div><div>Points accounts NOT in resolved wallets: ${ptsAccounts.filter(a=>!resolvedSet.has(a)).length} of ${ptsAccounts.length}</div><div>Points accounts that ARE locker addresses: ${ptsAsLockers.length}</div><div>Points accounts that own a locker: ${ptsWithLockers.length}</div><div style="margin-top:6px">Sample resolved wallet: ${resolvedWallets[0]||'none'}</div><div>Sample points account: ${ptsAccounts[0]||'none'}</div><div style="margin-top:6px">Unmatched resolved (5): ${unmatchedWallets.join(', ')||'none'}</div><div>Unmatched points (5): ${unmatchedPts.join(', ')||'none'}</div><div style="margin-top:6px">Action data: ${JSON.stringify(actions)}</div></div>`;
   document.getElementById('ft').textContent=`Generated ${new Date().toISOString().slice(0,16).replace('T',' ')} UTC · Live data from Superfluid Subgraph + Points API`;
   window._pr=pr;window._tr=tr;window._tS=tS;window._tF=tF;window._st={tS,tF,m:pr.length,cn,pa:tr.length,tP,avg:tS/pr.length,med,t10p:t10/tS*100,g,u:Number(pool.totalUnits),price,matched,lkCount:Object.keys(lockers).length};
 }
