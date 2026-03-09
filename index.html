@@ -211,7 +211,6 @@ async function go(){
     Object.entries(evAgg).forEach(([name,data])=>{
       actions[name]={points:data.estPts||data.samplePts,totalEvents:data.totalDocs||data.count,estimated:!!(data.estPts)};
     });
-    console.log('Discovered event types:',JSON.stringify(evAgg));
     ms('s6','done');
 
     // Step 7: Wallet↔Locker mapping
@@ -347,44 +346,22 @@ function render(){
   const matched=pr.filter(r=>r.matched).length;
   const walletsMapped=pr.filter(r=>r.wallet).length;
 
-  // Diagnostics
-  const fwdMatches=mem.filter(m=>{const w=lockers[m.account.id.toLowerCase()];return w&&ptsMap[w];}).length;
-  const revMatches=Object.keys(ptsToPoolMember).length;
-  const ptsAccounts=Object.keys(ptsMap);
-  const resolvedWallets=pr.filter(r=>r.wallet).map(r=>r.wallet);
-  const resolvedSet=new Set(resolvedWallets);
-  const ptsSet=new Set(ptsAccounts);
-  const lockerSet=new Set(Object.keys(lockers));
-  const ptsAsLockers=ptsAccounts.filter(a=>lockerSet.has(a));
-  const ptsWithLockers=ptsAccounts.filter(a=>ownerToLockers[a]);
-  const ptsWithPoolLockers=Object.keys(ptsToPoolMember).length;
-  const overlap=[...resolvedSet].filter(w=>ptsSet.has(w));
-  const unmatchedWallets=[...resolvedSet].filter(w=>!ptsSet.has(w)).slice(0,3);
-  const unmatchedPts=ptsAccounts.filter(a=>!resolvedSet.has(a)).slice(0,3);
-  console.log('=== MATCH DIAGNOSTICS ===');
-  console.log('Forward matches (pool→locker→wallet→pts):',fwdMatches);
-  console.log('Reverse matches (pts→lockers→pool):',revMatches);
-  console.log('Combined unique matches:',matched);
-  console.log('Pts accounts owning lockers:',ptsWithLockers.length);
-  console.log('Pts accounts with lockers IN pool:',ptsWithPoolLockers);
-  console.log('========================');
-
   document.getElementById('k1').innerHTML=`
     <div class="k g"><div class="kl">Total Pool Funding</div><div class="kv">${f(tF)} SUP</div><div class="ku">${usd(tF)}</div><div class="ks">Season 4 allocation</div></div>
     <div class="k g"><div class="kl">Distributed to Members</div><div class="kv">${f(tS)} SUP</div><div class="ku">${usd(tS)}</div><div class="ks">${f(pr.length)} recipients</div></div>
     <div class="k b"><div class="kl">Pool Members</div><div class="kv">${f(pr.length)}</div><div class="ks">${walletsMapped?f(walletsMapped)+' wallets resolved':'Locker→wallet mapping not loaded'}</div></div>
     <div class="k o"><div class="kl">Points Participants</div><div class="kv">${f(tr.length)}</div><div class="ks">${wP} earned points from actions · ${tr.length-wP} registered but inactive</div></div>
     <div class="k p"><div class="kl">Total Points</div><div class="kv">${f(tP)}</div></div>`;
-  // Dynamic banner
+  // Banner
   const lkCount2=Object.keys(lockers).length;
-  if(matched>0&&matched>=walletsMapped*0.5){
-    document.getElementById('banner').innerHTML=`<strong>✅ Datasets Linked:</strong> ${f(lkCount2)} locker→wallet mappings loaded. <strong>${matched}</strong> of ${pr.length} pool members matched to points data. The table shows wallet, locker, SUP received, and points earned.`;
+  if(matched>0){
+    document.getElementById('banner').innerHTML=`<strong>✅ Data linked:</strong> ${f(matched)} of ${pr.length} pool members matched to points accounts via ${f(lkCount2)} locker mappings. The remaining pool members use fontaine sub-contracts that require a Base-chain locker subgraph to resolve.`;
     document.getElementById('banner').style.borderLeftColor='var(--green)';
-  }else if(matched>0){
-    document.getElementById('banner').innerHTML=`<strong>⚠️ Partial Match (${matched}/${pr.length}):</strong> ${f(lkCount2)} lockers loaded, ${walletsMapped} wallets resolved, but only ${matched} matched to points data. Most pool members appear to be <strong>fontaine/reserve sub-contracts</strong> rather than locker addresses directly. The locker subgraph's <code style="font-size:11px;background:var(--surface2);padding:2px 4px;border-radius:3px">fontaines</code> field may bridge the gap — ask your team to confirm. ${ptsWithLockers.length} of ${ptsAccounts.length} points accounts own lockers.`;
+  }else if(lkCount2>0){
+    document.getElementById('banner').innerHTML=`<strong>ℹ️ Mapping loaded:</strong> ${f(lkCount2)} lockers indexed, ${walletsMapped} wallets resolved, but no overlap with points accounts. Pool and points data shown independently.`;
     document.getElementById('banner').style.borderLeftColor='var(--orange)';
   }else{
-    document.getElementById('banner').innerHTML=`<strong>📋 Setup Required:</strong> To link pool members to user wallets, add a <code style="font-size:11px;background:var(--surface2);padding:2px 4px;border-radius:3px">lockers.json</code> file to the same folder as this page. Run <code style="font-size:11px;background:var(--surface2);padding:2px 4px;border-radius:3px">fetch_lockers.ps1</code> to generate it. Without this file, pool members (locker addresses) and points (wallet addresses) are shown as separate datasets.`;
+    document.getElementById('banner').innerHTML=`<strong>ℹ️ No mapping:</strong> Place <code style="font-size:11px;background:var(--surface2);padding:2px 4px;border-radius:3px">lockers.json</code> alongside this page to link pool members to user wallets.`;
     document.getElementById('banner').style.borderLeftColor='var(--accent)';
   }
   document.getElementById('k2').innerHTML=`
@@ -432,18 +409,8 @@ function render(){
       </div>`;
   });
   actHTML+='</div>';
-  // Compact donut chart
-  if(actTotal>0&&actionKeys.length>1){
-    actHTML+='<div style="max-width:280px;margin:0 auto"><canvas id="actPie" height="200"></canvas></div>';
-  }
   actHTML+='</div>';
   document.getElementById('actions-section').innerHTML=actHTML;
-  if(actTotal>0&&actionKeys.length>1){
-    const aLabels=actionKeys.filter(k=>typeof actions[k].points==='number'&&actions[k].points>0).map(k=>evLabels[k]||k);
-    const aData=actionKeys.filter(k=>typeof actions[k].points==='number'&&actions[k].points>0).map(k=>actions[k].points);
-    const aColors=actionKeys.filter(k=>typeof actions[k].points==='number'&&actions[k].points>0).map((_,i)=>palette[i%palette.length]);
-    new Chart(document.getElementById('actPie'),{type:'doughnut',data:{labels:aLabels,datasets:[{data:aData,backgroundColor:aColors,borderWidth:0}]},options:{responsive:true,maintainAspectRatio:true,plugins:{legend:{position:'bottom',labels:{color:'#8b949e',font:{size:10},padding:10,boxWidth:12}}}}});
-  }
 
   const maxSUP=pr.length?pr[0].s:1;
   let h='<div style="overflow-x:auto"><table><thead><tr><th>#</th><th>Wallet</th><th>Locker</th><th>SUP Received</th><th>Points</th><th>Units</th><th>Share</th></tr></thead><tbody>';
@@ -456,7 +423,7 @@ function render(){
   tr.slice(0,30).forEach((r,i)=>{const pPct=Math.round(r.p/maxPts*100);p+=`<tr><td class="mono" style="color:var(--textMuted)">${i+1}</td><td class="mono" style="font-size:11px">${ad(r.a)}</td><td style="font-weight:600;color:var(--orange)">${f(r.p)}<div style="margin-top:3px;height:3px;background:var(--border);border-radius:2px;width:100px"><div style="height:3px;background:var(--orange);border-radius:2px;width:${pPct}px"></div></div></td><td style="color:var(--textDim)">${f(r.e)}</td><td class="mono" style="color:var(--textDim);font-size:11px">${r.l?r.l.slice(0,10):'—'}</td></tr>`;});
   p+='</tbody></table></div>';document.getElementById('tt').innerHTML=p;
 
-  document.getElementById('tech').innerHTML=`<div style="font-size:13px;font-weight:600;color:var(--white);margin-bottom:8px;font-family:'DM Sans'">Technical Details</div><div>Token: SUP · ${pool.token.id}</div><div>Pool: ${PID}</div><div>Admin: ${pool.admin.id}</div><div>Network: Base Mainnet (8453)</div><div>Campaign: #${CID}</div><div>Flow Rate: ${pool.flowRate} (complete)</div><div>Units: ${f(Number(pool.totalUnits))}</div><div>Updated: ${new Date(Number(pool.updatedAtTimestamp)*1000).toISOString()}</div><div>Locker Mapping: ${f(lkCount)} lockers indexed · ${walletsMapped} pool members mapped · ${matched} matched to points</div><div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)"><div style="font-size:12px;font-weight:600;color:var(--orange);margin-bottom:6px;font-family:'DM Sans'">Match Diagnostics</div><div>Forward join (pool→locker→wallet→pts): ${fwdMatches}</div><div>Reverse join (pts→lockers→pool): ${revMatches}</div><div>Combined matched: ${matched}</div><div>Points accounts owning lockers: ${ptsWithLockers.length} of ${ptsAccounts.length}</div><div>Pts accounts with lockers IN pool: ${ptsWithPoolLockers}</div><div style="margin-top:6px">Sample resolved wallet: ${resolvedWallets[0]||'none'}</div><div>Sample points account: ${ptsAccounts[0]||'none'}</div><div>Unmatched resolved (3): ${unmatchedWallets.join(', ')||'none'}</div><div>Unmatched points (3): ${unmatchedPts.join(', ')||'none'}</div><div style="margin-top:6px">Action data: ${JSON.stringify(actions)}</div></div>`;
+  document.getElementById('tech').innerHTML=`<div style="font-size:13px;font-weight:600;color:var(--white);margin-bottom:8px;font-family:'DM Sans'">Technical Details</div><div>Token: SUP · ${pool.token.id}</div><div>Pool: ${PID}</div><div>Admin: ${pool.admin.id}</div><div>Network: Base Mainnet (8453)</div><div>Campaign: #${CID}</div><div>Flow Rate: ${pool.flowRate} (complete)</div><div>Units: ${f(Number(pool.totalUnits))}</div><div>Updated: ${new Date(Number(pool.updatedAtTimestamp)*1000).toISOString()}</div><div>Locker Mapping: ${f(lkCount)} lockers indexed · ${walletsMapped} wallets resolved · ${matched} matched to points</div>`;
   document.getElementById('ft').textContent=`Generated ${new Date().toISOString().slice(0,16).replace('T',' ')} UTC · Live data from Superfluid Subgraph + Points API`;
   window._pr=pr;window._tr=tr;window._tS=tS;window._tF=tF;window._st={tS,tF,m:pr.length,cn,pa:tr.length,tP,avg:tS/pr.length,med,t10p:t10/tS*100,g,u:Number(pool.totalUnits),price,matched,lkCount:Object.keys(lockers).length};
 }
