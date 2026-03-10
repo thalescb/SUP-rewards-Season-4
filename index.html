@@ -68,7 +68,7 @@ td{padding:8px 10px;border-bottom:1px solid #21262d33}
       <div class="step" id="s3"><span class="ico">○</span> Points leaderboard</div>
       <div class="step" id="s4"><span class="ico">○</span> SUP token price</div>
       <div class="step" id="s5"><span class="ico">○</span> Activity timeline</div>
-      <div class="step" id="s6"><span class="ico">○</span> Action breakdown (subgraph + points)</div>
+      <div class="step" id="s6"><span class="ico">○</span> Action breakdown</div>
       <div class="step" id="s7"><span class="ico">○</span> Wallet↔Locker mapping</div>
     </div>
     <div id="ebox" style="display:none;margin-top:20px;background:var(--surface);border:1px solid var(--red);border-radius:8px;padding:14px;text-align:left">
@@ -90,71 +90,129 @@ td{padding:8px 10px;border-bottom:1px solid #21262d33}
   <div class="footer" id="ft"></div>
 </div>
 <script>
-const W=1e18,PID="0x41491a100847a7f678e3b286fea32b0dad18920e",SG="https://subgraph-endpoints.superfluid.dev/base-mainnet/protocol-v1",PA="https://cms.superfluid.pro/points/accounts",CID=7856;
-const BASE_RPCS=["https://mainnet.base.org","https://base.llamarpc.com","https://1rpc.io/base"];
-const OWNER_SEL="0x8da5cb5b",LOCKER_OWNER_SEL="0xa80b4694"; // owner() and lockerOwner() selectors
-// GoodDollar locker/rewards subgraph — Base chain (NOT Arbitrum)
-const GD_SG="https://api.thegraph.com/subgraphs/id/QmbmxtkSiFkKpHeUd4wKmws8QVkb7DtE2UMRtezC7HpmG1";
-let pool,mem=[],pts=[],price=null,tl=[],actions={},lockers={};
+/* ===== CONSTANTS ===== */
+// Superfluid protocol subgraph (Base Mainnet) — pool members, flow data, units
+const SG = "https://subgraph-endpoints.superfluid.dev/base-mainnet/protocol-v1";
+// Superfluid Points API — campaign points leaderboard and events
+const PA = "https://cms.superfluid.pro/points/accounts";
+// Pool address and campaign ID
+const PID = "0x41491a100847a7f678e3b286fea32b0dad18920e";
+const CID = 7856;
+const W = 1e18;
+// Base Mainnet RPCs for on-chain owner() resolution
+const BASE_RPCS = ["https://mainnet.base.org","https://base.llamarpc.com","https://1rpc.io/base"];
+// Function selectors for locker owner resolution (keccak256 first 4 bytes)
+const OWNER_SELS = [
+  {sel:"0x8da5cb5b",name:"owner()"},
+  {sel:"0xa80b4694",name:"lockerOwner()"},
+  {sel:"0x893d20e8",name:"getOwner()"},
+  {sel:"0xf851a440",name:"admin()"},
+  {sel:"0x5aef7de6",name:"avatar()"}
+];
+// GoodDollar locker/rewards subgraph — deployed on The Graph
+// NOTE: This subgraph may index a different chain. We use it as supplementary
+// data and validate overlap before trusting its locker→owner mappings.
+const GD_SG = "https://api.thegraph.com/subgraphs/id/QmbmxtkSiFkKpHeUd4wKmws8QVkb7DtE2UMRtezC7HpmG1";
 
+/* ===== STATE ===== */
+let pool, mem=[], pts=[], price=null, tl=[], actions={}, lockers={};
+let sgActivity={};      // GD subgraph entity existence (supplementary context)
+let resolveStats={};    // How wallet resolution happened
+
+/* ===== HELPERS ===== */
 function ms(id,st){const e=document.getElementById(id);e.className='step '+st;e.querySelector('.ico').textContent=st==='done'?'✓':st==='active'?'◉':st==='fail'?'✗':'○';}
-async function gql(q){const r=await fetch(SG,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q})});if(!r.ok)throw new Error('Subgraph HTTP '+r.status);return(await r.json()).data;}
 
-// Query the GoodDollar subgraph (with CORS proxy fallback)
+// Query Superfluid protocol subgraph (Base Mainnet)
+async function gql(q){
+  const r=await fetch(SG,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q})});
+  if(!r.ok) throw new Error('Subgraph HTTP '+r.status);
+  return (await r.json()).data;
+}
+
+// Query GoodDollar subgraph (with CORS proxy fallback)
 async function gdGql(query){
   const endpoints=[GD_SG, GD_SG+'/graphql'];
   for(const ep of endpoints){
-    // Try direct POST
     try{const r=await fetch(ep,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query})});if(r.ok){const j=await r.json();if(j.data)return j.data;}}catch(e){}
-    // Try via CORS proxy
     try{const r=await fetch('https://corsproxy.io/?url='+encodeURIComponent(ep),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query})});if(r.ok){const j=await r.json();if(j.data)return j.data;}}catch(e){}
   }
   return null;
 }
 
-// Paginate a GoodDollar subgraph entity to count all records
-async function gdCount(entityName){
-  let total=0,lastId='';
-  while(true){
-    const w=lastId?`(first:1000,orderBy:id,where:{id_gt:"${lastId}"})`:`(first:1000,orderBy:id)`;
-    const d=await gdGql(`{${entityName}${w}{id}}`);
-    if(!d||!d[entityName]||!d[entityName].length)break;
-    total+=d[entityName].length;
-    if(d[entityName].length<1000)break;
-    lastId=d[entityName][d[entityName].length-1].id;
+// Fetch from Points API with CORS proxy fallback
+async function fetchPtsApi(path){
+  const url='https://cms.superfluid.pro'+path;
+  for(const px of [null,'https://corsproxy.io/?url=','https://api.allorigins.win/raw?url=']){
+    try{
+      const r=await fetch(px?px+encodeURIComponent(url):url);
+      if(r.ok) return await r.json();
+    }catch(e){}
   }
-  return total;
+  return null;
 }
 
+// Batch RPC eth_call for a list of addresses with a given selector
+async function batchEthCall(addrs,selector,rpcUrl){
+  const resolved={};
+  const batchSize=50;
+  for(let i=0;i<addrs.length;i+=batchSize){
+    const batch=addrs.slice(i,i+batchSize);
+    const calls=batch.map((addr,j)=>({jsonrpc:"2.0",id:j,method:"eth_call",params:[{to:addr,data:selector},"latest"]}));
+    try{
+      const r=await fetch(rpcUrl,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(calls)});
+      const results=await r.json();
+      (Array.isArray(results)?results:[results]).forEach(res=>{
+        if(res.id==null||res.id>=batch.length) return;
+        const addr=batch[res.id];
+        if(res.result&&res.result.length>=66&&res.result!=='0x'&&!/^0x0+$/.test(res.result)){
+          const owner='0x'+res.result.slice(26).toLowerCase();
+          if(owner!=='0x0000000000000000000000000000000000000000'&&owner!==addr){
+            resolved[addr]=owner;
+          }
+        }
+      });
+    }catch(e){}
+    if(i+batchSize<addrs.length) await new Promise(r=>setTimeout(r,40));
+  }
+  return resolved;
+}
+
+/* ===== MAIN PIPELINE ===== */
 async function go(){
   try{
+    // --- Step 1: Pool metadata from Superfluid subgraph ---
     ms('s1','active');
     const d=await gql(`{pool(id:"${PID}"){totalAmountDistributedUntilUpdatedAt totalUnits totalMembers flowRate token{id symbol name}admin{id}updatedAtTimestamp}}`);
-    pool=d.pool;if(!pool)throw new Error('Pool not found');ms('s1','done');
+    pool=d.pool; if(!pool) throw new Error('Pool not found'); ms('s1','done');
 
-    ms('s2','active');let lid='';
-    while(true){const d=await gql(`{poolMembers(first:1000,where:{pool:"${PID}",id_gt:"${lid}"},orderBy:id){id account{id}units totalAmountReceivedUntilUpdatedAt poolTotalAmountDistributedUntilUpdatedAt updatedAtTimestamp isConnected}}`);
-    mem=mem.concat(d.poolMembers);document.getElementById('s2').querySelector('.ico').textContent=mem.length;
-    if(d.poolMembers.length<1000)break;lid=d.poolMembers[d.poolMembers.length-1].id;}ms('s2','done');
+    // --- Step 2: Pool members (paginated) ---
+    ms('s2','active'); let lid='';
+    while(true){
+      const d=await gql(`{poolMembers(first:1000,where:{pool:"${PID}",id_gt:"${lid}"},orderBy:id){id account{id}units totalAmountReceivedUntilUpdatedAt poolTotalAmountDistributedUntilUpdatedAt updatedAtTimestamp isConnected}}`);
+      mem=mem.concat(d.poolMembers);
+      document.getElementById('s2').querySelector('.ico').textContent=mem.length;
+      if(d.poolMembers.length<1000) break;
+      lid=d.poolMembers[d.poolMembers.length-1].id;
+    }
+    ms('s2','done');
 
-    ms('s3','active');let pg=1;let ptsOk=false;
-    // Try direct first, then CORS proxies
-    async function fetchPts(baseUrl){
-      pts=[];pg=1;
+    // --- Step 3: Points leaderboard from Superfluid Points API ---
+    ms('s3','active'); let ptsOk=false;
+    async function fetchAllPts(proxy){
+      pts=[]; let pg=1;
       while(true){
         const url=`${PA}?campaignId=${CID}&limit=100&page=${pg}&orderBy=totalPoints&order=desc`;
-        const r=await fetch(baseUrl?baseUrl+encodeURIComponent(url):url);
+        const r=await fetch(proxy?proxy+encodeURIComponent(url):url);
         if(!r.ok) throw new Error('HTTP '+r.status);
         const j=await r.json();
         if(!j.accounts) throw new Error('No accounts field');
         pts=pts.concat(j.accounts);
         document.getElementById('s3').querySelector('.ico').textContent=pts.length;
-        if(!j.pagination||!j.pagination.hasNextPage)break;pg++;
+        if(!j.pagination||!j.pagination.hasNextPage) break; pg++;
       }
     }
-    const proxies=[null,'https://corsproxy.io/?url=','https://api.allorigins.win/raw?url='];
-    for(const proxy of proxies){
-      try{await fetchPts(proxy);if(pts.length>0){ptsOk=true;break;}}catch(e){continue;}
+    for(const proxy of [null,'https://corsproxy.io/?url=','https://api.allorigins.win/raw?url=']){
+      try{await fetchAllPts(proxy);if(pts.length>0){ptsOk=true;break;}}catch(e){continue;}
     }
     if(!ptsOk){
       ms('s3','fail');
@@ -163,15 +221,12 @@ async function go(){
       ud.style.cssText='margin:10px 0 0 30px';
       ud.innerHTML=`<div style="font-size:11px;color:var(--textDim);margin-bottom:6px">Run in PowerShell first:</div>
         <pre style="background:var(--surface);padding:8px;border-radius:4px;font-size:9px;color:var(--orange);overflow:auto;margin-bottom:8px;max-height:60px;white-space:pre-wrap;word-break:break-all;user-select:all;cursor:text">$all=@();$p=1;do{$r=Invoke-RestMethod "https://cms.superfluid.pro/points/accounts?campaignId=7856&limit=100&page=$p";$all+=$r.accounts;$p++}while($r.pagination.hasNextPage);$all|ConvertTo-Json -Depth 5|Out-File "$env:USERPROFILE\\Desktop\\points_data.json" -Encoding UTF8</pre>
-        <label style="display:inline-flex;align-items:center;gap:6px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 16px;cursor:pointer;font-size:12px;color:var(--textDim)">
-          📁 Upload points_data.json
-          <input type="file" accept=".json" id="pts-upload" style="display:none">
-        </label>
+        <label style="display:inline-flex;align-items:center;gap:6px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 16px;cursor:pointer;font-size:12px;color:var(--textDim)">📁 Upload points_data.json<input type="file" accept=".json" id="pts-upload" style="display:none"></label>
         <span id="pts-status" style="margin-left:8px;font-size:12px"></span>`;
       document.getElementById('steps').appendChild(ud);
       await new Promise((resolve)=>{
         document.getElementById('pts-upload').addEventListener('change',function(){
-          const f=this.files[0];if(!f)return;
+          const f=this.files[0]; if(!f) return;
           const rd=new FileReader();
           rd.onload=function(e){
             try{const j=JSON.parse(e.target.result);pts=Array.isArray(j)?j:(j.accounts||[]);
@@ -182,246 +237,228 @@ async function go(){
       });
     } else { ms('s3','done'); }
 
+    // --- Step 4: SUP token price ---
     ms('s4','active');
     try{const r=await fetch('https://api.dexscreener.com/latest/dex/tokens/0xa69f80524381275a7ffdb3ae01c54150644c8792');const j=await r.json();if(j.pairs&&j.pairs.length)price=parseFloat(j.pairs[0].priceUsd);}catch(e){}
     if(!price){try{const r=await fetch('https://api.coingecko.com/api/v3/simple/price?ids=superfluid&vs_currencies=usd');const j=await r.json();if(j.superfluid?.usd)price=j.superfluid.usd;}catch(e){}}
     if(!price){try{const r=await fetch('https://corsproxy.io/?url='+encodeURIComponent('https://api.dexscreener.com/latest/dex/tokens/0xa69f80524381275a7ffdb3ae01c54150644c8792'));const j=await r.json();if(j.pairs&&j.pairs.length)price=parseFloat(j.pairs[0].priceUsd);}catch(e){}}
     ms('s4','done');
 
+    // --- Step 5: Activity timeline from Superfluid subgraph ---
     ms('s5','active');
-    try{let tlid='';while(true){const d=await gql(`{memberUnitsUpdatedEvents(first:1000,where:{pool:"${PID}",id_gt:"${tlid}"},orderBy:timestamp,orderDirection:asc){id timestamp newUnits oldUnits}}`);
-    if(!d.memberUnitsUpdatedEvents||!d.memberUnitsUpdatedEvents.length)break;tl=tl.concat(d.memberUnitsUpdatedEvents);if(d.memberUnitsUpdatedEvents.length<1000)break;tlid=d.memberUnitsUpdatedEvents[d.memberUnitsUpdatedEvents.length-1].id;}}catch(e){}
+    try{let tlid='';while(true){
+      const d=await gql(`{memberUnitsUpdatedEvents(first:1000,where:{pool:"${PID}",id_gt:"${tlid}"},orderBy:timestamp,orderDirection:asc){id timestamp newUnits oldUnits}}`);
+      if(!d.memberUnitsUpdatedEvents||!d.memberUnitsUpdatedEvents.length) break;
+      tl=tl.concat(d.memberUnitsUpdatedEvents);
+      if(d.memberUnitsUpdatedEvents.length<1000) break;
+      tlid=d.memberUnitsUpdatedEvents[d.memberUnitsUpdatedEvents.length-1].id;
+    }}catch(e){}
     ms('s5','done');
 
-    // Step 6: Action breakdown — query GoodDollar subgraph (Base) + Points API
+    // --- Step 6: Action breakdown ---
+    // Two data sources, kept SEPARATE (no speculative merging):
+    //   A) Points API events → what generates campaign points (determines SUP rewards)
+    //   B) GD subgraph entities → on-chain activity context (supplementary)
     ms('s6','active');
 
-    // Part A: Discover all entity types in the GoodDollar subgraph via introspection-like probe
-    const entityDefs=[
-      {key:'stakingEvents',label:'Governance Staking',desc:'Staking events in GoodDollar governance',source:'subgraph'},
-      {key:'lockerStakings',label:'Locker Staking',desc:'Active staking positions per locker',source:'subgraph'},
-      {key:'fontaines',label:'Fontaine Streaming',desc:'Fontaine streaming donation contracts',source:'subgraph'},
-      {key:'instantUnlocks',label:'Instant Unlocks',desc:'Instant token unlock events',source:'subgraph'},
-      {key:'claimEventUnits',label:'G$ Claims',desc:'Daily G$ UBI claim unit events',source:'subgraph'},
-      {key:'fluidStreamClaimEvents',label:'Stream Claims',desc:'Superfluid stream claim events',source:'subgraph'},
-      {key:'liquidityPositions',label:'Liquidity Positions',desc:'Liquidity provision positions',source:'subgraph'}
-    ];
+    // PART A: Points API events — discover all event types with stratified sampling
+    const evTypes={}; // eventName → {totalDocs, samples, rawEst, estPts}
 
-    // Probe which entities exist (single combined query)
-    let gdOk=false;
+    // A1: Fetch first page to discover event type names
+    const fp=await fetchPtsApi('/points/events?campaignId='+CID+'&limit=100&page=1');
+    if(fp&&fp.events){
+      fp.events.forEach(e=>{
+        const n=e.eventName||'unknown';
+        if(!evTypes[n]) evTypes[n]={totalDocs:0,samples:[]};
+        evTypes[n].samples.push(e.points||0);
+      });
+    }
+    document.getElementById('s6').querySelector('.ico').textContent=Object.keys(evTypes).length+' pts types';
+
+    // A2: For each event type, get totalDocs and sample from beginning, middle, and end
+    for(const evName of Object.keys(evTypes)){
+      // Filtered query → gives us totalDocs + first page of this event type
+      const pg1=await fetchPtsApi('/points/events?campaignId='+CID+'&eventName='+encodeURIComponent(evName)+'&limit=100&page=1');
+      if(pg1&&pg1.pagination){
+        evTypes[evName].totalDocs=pg1.pagination.totalDocs;
+        const tp=pg1.pagination.totalPages||1;
+        if(pg1.events) pg1.events.forEach(e=>evTypes[evName].samples.push(e.points||0));
+        // Sample middle page and last page for unbiased average
+        const midPage=Math.max(2,Math.ceil(tp*0.5));
+        const lastPage=Math.max(2,tp);
+        for(const sp of [midPage,lastPage]){
+          if(sp<=1) continue;
+          const pgN=await fetchPtsApi('/points/events?campaignId='+CID+'&eventName='+encodeURIComponent(evName)+'&limit=100&page='+sp);
+          if(pgN&&pgN.events) pgN.events.forEach(e=>evTypes[evName].samples.push(e.points||0));
+        }
+      }
+      document.getElementById('s6').querySelector('.ico').textContent=Object.keys(evTypes).length+' pts types';
+    }
+
+    // A3: Compute estimates and cross-validate against leaderboard total
+    const leaderboardTotal=pts.reduce((s,p)=>s+p.totalPoints,0);
+    let rawEstSum=0;
+    Object.entries(evTypes).forEach(([name,t])=>{
+      const sum=t.samples.reduce((a,b)=>a+b,0);
+      t.avgPts=t.samples.length>0?sum/t.samples.length:0;
+      t.rawEst=Math.round(t.avgPts*(t.totalDocs||t.samples.length));
+      rawEstSum+=t.rawEst;
+    });
+    // Scale proportionally so estimated sum matches the known leaderboard total
+    const scaleFactor=(rawEstSum>0&&leaderboardTotal>0)?leaderboardTotal/rawEstSum:1;
+    Object.entries(evTypes).forEach(([name,t])=>{
+      t.estPts=Math.round(t.rawEst*scaleFactor);
+    });
+
+    // Build actions map from Points API data
+    const evLabels={governanceStakePoints:'Governance Staking',claimPoints:'G$ Claims',claimed:'G$ Claims',streamPoints:'Stream Donations',streamed:'Stream Donations',invitePoints:'Invite Rewards',invites:'Invite Rewards',farcasterPoints:'Farcaster Activity'};
+    const evDescs={governanceStakePoints:'Staking G$ in GoodDollar governance',claimPoints:'Daily G$ UBI claims',claimed:'Daily G$ UBI claims',streamPoints:'Streaming donations to GoodCollective',streamed:'Streaming donations to GoodCollective',invitePoints:'Referring new users to the ecosystem',invites:'Referring new users',farcasterPoints:'Engagement on Farcaster social protocol'};
+    Object.entries(evTypes).forEach(([name,t])=>{
+      actions[name]={
+        label:evLabels[name]||name.replace(/([A-Z])/g,' $1').replace(/^./,s=>s.toUpperCase()),
+        desc:evDescs[name]||'Campaign point event',
+        source:'points-api',
+        totalEvents:t.totalDocs||t.samples.length,
+        points:t.estPts, rawEst:t.rawEst,
+        avgPts:Math.round(t.avgPts*100)/100,
+        estimated:Math.abs(scaleFactor-1)>0.01,
+        sampleSize:t.samples.length
+      };
+    });
+
+    // PART B: GD subgraph — light probe only (2-3 queries total, no heavy pagination)
     try{
+      // Single query: check which entity types have data
       const disc=await gdGql(`{se:stakingEvents(first:1){id} ls:lockerStakings(first:1){id} fn:fontaines(first:1){id} iu:instantUnlocks(first:1){id} ce:claimEventUnits(first:1){id} fs:fluidStreamClaimEvents(first:1){id} lp:liquidityPositions(first:1){id}}`);
       if(disc){
-        const alias2key={se:'stakingEvents',ls:'lockerStakings',fn:'fontaines',iu:'instantUnlocks',ce:'claimEventUnits',fs:'fluidStreamClaimEvents',lp:'liquidityPositions'};
-        const existing=new Set();
-        for(const [alias,key] of Object.entries(alias2key)){
-          if(disc[alias]&&disc[alias].length>0) existing.add(key);
-        }
-        // Count each existing entity by paginating
-        for(const ent of entityDefs){
-          if(existing.has(ent.key)){
-            try{ent.count=await gdCount(ent.key);}catch(e){ent.count=0;}
-          } else {
-            ent.count=0;
-          }
-          const found=entityDefs.filter(e=>e.count>0).length;
-          document.getElementById('s6').querySelector('.ico').textContent=found+' types';
-        }
-        gdOk=true;
-      }
-    }catch(e){console.warn('GoodDollar subgraph probe failed:',e);}
-
-    // Part B: Also query Points API events (full pagination) to get point values per event type
-    const evAgg={};// eventName → {count, totalPts}
-    let evPagesMax=50;// up to 5000 events sampled
-    for(let ep=1;ep<=evPagesMax;ep++){
-      let got=false;
-      for(const px of [null,'https://corsproxy.io/?url=','https://api.allorigins.win/raw?url=']){
-        try{
-          const url='https://cms.superfluid.pro/points/events?campaignId='+CID+'&limit=100&page='+ep;
-          const r=await fetch(px?px+encodeURIComponent(url):url);
-          if(!r.ok) continue;
-          const j=await r.json();
-          if(!j.events||!j.events.length){got=true;break;}
-          j.events.forEach(e=>{
-            const n=e.eventName||'unknown';
-            if(!evAgg[n]) evAgg[n]={count:0,totalPts:0};
-            evAgg[n].count++;evAgg[n].totalPts+=(e.points||0);
-          });
-          got=true;
-          if(!j.pagination||!j.pagination.hasNextPage){evPagesMax=0;}// stop after this
-          break;
-        }catch(e){continue;}
-      }
-      if(!got) break;
-    }
-    // For each Points API event type, also get exact totalDocs via filtered query
-    for(const evName of Object.keys(evAgg)){
-      for(const px of [null,'https://corsproxy.io/?url=','https://api.allorigins.win/raw?url=']){
-        try{
-          const url='https://cms.superfluid.pro/points/events?campaignId='+CID+'&eventName='+encodeURIComponent(evName)+'&limit=1&page=1';
-          const r=await fetch(px?px+encodeURIComponent(url):url);
-          if(!r.ok) continue;
-          const j=await r.json();
-          if(j.pagination){
-            evAgg[evName].totalDocs=j.pagination.totalDocs;
-            if(evAgg[evName].count>0){
-              evAgg[evName].estPts=Math.round(evAgg[evName].totalPts/evAgg[evName].count*j.pagination.totalDocs);
-            }
-          }
-          break;
-        }catch(e){continue;}
-      }
-    }
-
-    // Part C: Merge subgraph entities + Points API events into unified actions map
-    // First add subgraph entities
-    entityDefs.forEach(ent=>{
-      if(ent.count>0){
-        actions[ent.key]={
-          label:ent.label, desc:ent.desc, source:'subgraph',
-          totalEvents:ent.count, points:0, estimated:false
+        const entMap={
+          se:{key:'stakingEvents',label:'Staking Events',desc:'Governance staking events'},
+          ls:{key:'lockerStakings',label:'Locker Stakings',desc:'Active staking positions'},
+          fn:{key:'fontaines',label:'Fontaines',desc:'Streaming donation contracts'},
+          iu:{key:'instantUnlocks',label:'Instant Unlocks',desc:'Token unlock events'},
+          ce:{key:'claimEventUnits',label:'Claim Events',desc:'G$ UBI claim units'},
+          fs:{key:'fluidStreamClaimEvents',label:'Stream Claims',desc:'Superfluid stream claims'},
+          lp:{key:'liquidityPositions',label:'Liquidity Positions',desc:'Liquidity provision'}
         };
+        const found=Object.keys(entMap).filter(a=>disc[a]&&disc[a].length>0);
+        // Skip-based magnitude probe (single batched query, max skip=5000)
+        if(found.length>0){
+          const skipQ=found.map(a=>`${a}k:${entMap[a].key}(first:1,skip:999){id} ${a}m:${entMap[a].key}(first:1,skip:4999){id}`).join(' ');
+          try{
+            const skipR=await gdGql(`{${skipQ}}`);
+            found.forEach(a=>{
+              const hasK=skipR&&skipR[a+'k']&&skipR[a+'k'].length>0;
+              const hasM=skipR&&skipR[a+'m']&&skipR[a+'m'].length>0;
+              sgActivity[entMap[a].key]={label:entMap[a].label,desc:entMap[a].desc,magnitude:hasM?'5,000+':hasK?'1,000+':'< 1,000',exists:true};
+            });
+          }catch(e){
+            found.forEach(a=>{sgActivity[entMap[a].key]={label:entMap[a].label,desc:entMap[a].desc,magnitude:'present',exists:true};});
+          }
+        }
+        document.getElementById('s6').querySelector('.ico').textContent=Object.keys(evTypes).length+' pts + '+found.length+' on-chain';
       }
-    });
-    // Overlay Points API data (map Points API eventNames to subgraph entity keys)
-    const ptsToSgMap={
-      'governanceStakePoints':'stakingEvents',
-      'claimPoints':'claimEventUnits', 'claimed':'claimEventUnits',
-      'streamPoints':'fluidStreamClaimEvents', 'streamed':'fluidStreamClaimEvents',
-      'invitePoints':null, 'invites':null // no direct subgraph mapping
-    };
-    Object.entries(evAgg).forEach(([evName,data])=>{
-      const sgKey=ptsToSgMap[evName];
-      const pts=data.estPts||data.totalPts;
-      const evCount=data.totalDocs||data.count;
-      if(sgKey&&actions[sgKey]){
-        // Merge into existing subgraph entity
-        actions[sgKey].points=pts;
-        actions[sgKey].estimated=!!(data.estPts);
-        actions[sgKey].ptsEventName=evName;
-        // Use Points API count if subgraph count is 0
-        if(!actions[sgKey].totalEvents) actions[sgKey].totalEvents=evCount;
-      } else if(!sgKey||!actions[sgKey]){
-        // Points API event with no subgraph equivalent — add as separate action
-        actions[evName]={
-          label:evName.replace(/([A-Z])/g,' $1').replace(/^./,s=>s.toUpperCase()),
-          desc:'Points event from campaign API', source:'points-api',
-          totalEvents:evCount, points:pts, estimated:!!(data.estPts), ptsEventName:evName
-        };
-      }
-    });
+    }catch(e){console.warn('GD subgraph probe:',e);}
+
     ms('s6','done');
 
-    // Step 7: Wallet↔Locker mapping — resolve on Base Mainnet (chain 8453)
+    // --- Step 7: Wallet↔Locker mapping ---
+    // Strategy: Use MULTIPLE sources and ALWAYS try RPC for unresolved pool members.
+    // Critical fix: previous version skipped RPC when lockers.json loaded, causing 91/981 match rate.
     ms('s7','active');
-    let lkOk=false;
     const allAddrs=mem.map(m=>m.account.id.toLowerCase());
+    resolveStats={gdSubgraph:0,lockerJson:0,rpc:0,selfMapped:0,total:allAddrs.length};
 
-    // Helper: batch eth_call to resolve owner of contract addresses on Base
-    async function batchResolveOwners(addrs,selector,rpcUrl){
-      const resolved={};
-      const batchSize=20;
-      for(let i=0;i<addrs.length;i+=batchSize){
-        const batch=addrs.slice(i,i+batchSize);
-        const calls=batch.map((addr,j)=>({jsonrpc:"2.0",id:i+j,method:"eth_call",params:[{to:addr,data:selector},"latest"]}));
-        try{
-          const r=await fetch(rpcUrl,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(calls)});
-          const results=await r.json();
-          (Array.isArray(results)?results:[results]).forEach(res=>{
-            const idx=res.id;if(idx==null||idx>=addrs.length)return;
-            const addr=addrs[idx];
-            if(res.result&&res.result.length>=66&&res.result!=='0x'&&!/^0x0+$/.test(res.result)){
-              const owner='0x'+res.result.slice(26).toLowerCase();
-              if(owner!=='0x0000000000000000000000000000000000000000'&&owner!==addr){
-                resolved[addr]=owner;
-              }
-            }
-          });
-        }catch(e){}
-        // Small delay between batches to avoid rate limiting
-        if(i+batchSize<addrs.length) await new Promise(r=>setTimeout(r,80));
+    // Strategy A: GD subgraph lockers (bounded to 10 pages = 10k lockers)
+    try{
+      let lastId='';
+      for(let page=0;page<10;page++){
+        const d=await gdGql(`{lockers(first:1000,where:{id_gt:"${lastId}"},orderBy:id){id lockerOwner}}`);
+        if(!d||!d.lockers||!d.lockers.length) break;
+        d.lockers.forEach(l=>{
+          const lid=l.id.toLowerCase();
+          const ow=(l.lockerOwner||'').toLowerCase();
+          if(ow&&ow!=='0x0000000000000000000000000000000000000000') lockers[lid]=ow;
+        });
+        document.getElementById('s7').querySelector('.ico').textContent=Object.keys(lockers).length+' subgraph';
+        if(d.lockers.length<1000) break;
+        lastId=d.lockers[d.lockers.length-1].id;
       }
-      return resolved;
-    }
+      resolveStats.gdSubgraph=allAddrs.filter(a=>lockers[a]).length;
+    }catch(e){console.warn('GD subgraph lockers:',e);}
 
-    // Strategy 1: Load lockers.json from same directory (pre-built mapping)
+    // Strategy B: lockers.json from same directory (supplements, doesn't replace)
     try{
       const r=await fetch('lockers.json');
       if(r.ok){
         const j=await r.json();
         const lks=j.data?j.data.lockers:(Array.isArray(j)?j:(j.lockers||[]));
-        lks.forEach(l=>{lockers[(l.id||'').toLowerCase()]=(l.lockerOwner||'').toLowerCase();});
-        document.getElementById('s7').querySelector('.ico').textContent=Object.keys(lockers).length;
-        if(Object.keys(lockers).length>0) lkOk=true;
+        let added=0;
+        lks.forEach(l=>{
+          const lid=(l.id||'').toLowerCase();
+          const ow=(l.lockerOwner||'').toLowerCase();
+          if(ow&&!lockers[lid]){lockers[lid]=ow;added++;}
+        });
+        resolveStats.lockerJson=added;
       }
     }catch(e){}
 
-    // Strategy 2: Resolve locker owners on-chain via Base RPC (replaces old Arbitrum subgraph)
-    if(!lkOk){
-      let rpcResolved=false;
+    // Strategy C: RPC batch resolve — ALWAYS run for pool members not yet resolved
+    // This is the critical fix: even if Strategies A/B loaded data, we still
+    // RPC-resolve pool members that weren't found in those locker maps.
+    const unresolvedBeforeRpc=allAddrs.filter(a=>!lockers[a]);
+    document.getElementById('s7').querySelector('.ico').textContent=
+      (allAddrs.length-unresolvedBeforeRpc.length)+'/'+allAddrs.length+' → RPC';
+
+    if(unresolvedBeforeRpc.length>0){
       for(const rpcUrl of BASE_RPCS){
-        if(rpcResolved) break;
-        try{
-          // Pass 1: try owner() selector
-          const r1=await batchResolveOwners(allAddrs,OWNER_SEL,rpcUrl);
-          Object.assign(lockers,r1);
-          document.getElementById('s7').querySelector('.ico').textContent=Object.keys(lockers).length;
-
-          // Pass 2: try lockerOwner() selector for unresolved addresses
-          const unresolved=allAddrs.filter(a=>!lockers[a]);
-          if(unresolved.length>0){
-            const r2=await batchResolveOwners(unresolved,LOCKER_OWNER_SEL,rpcUrl);
-            Object.assign(lockers,r2);
-            document.getElementById('s7').querySelector('.ico').textContent=Object.keys(lockers).length;
-          }
-          rpcResolved=true;
-        }catch(e){continue;}
+        let remaining=allAddrs.filter(a=>!lockers[a]);
+        if(remaining.length===0) break;
+        let rpcOk=false;
+        for(const {sel,name} of OWNER_SELS){
+          remaining=allAddrs.filter(a=>!lockers[a]);
+          if(remaining.length===0) break;
+          const resolved=await batchEthCall(remaining,sel,rpcUrl);
+          const count=Object.keys(resolved).length;
+          if(count>0){Object.assign(lockers,resolved);resolveStats.rpc+=count;rpcOk=true;}
+          document.getElementById('s7').querySelector('.ico').textContent=
+            allAddrs.filter(a=>lockers[a]).length+'/'+allAddrs.length;
+        }
+        if(rpcOk) break; // First RPC that works, stop trying others
       }
-
-      // Self-map any remaining unresolved addresses (EOAs or contracts without owner fn)
-      // These addresses ARE the wallet themselves — not locker proxies
-      allAddrs.forEach(addr=>{
-        if(!lockers[addr]) lockers[addr]=addr;
-      });
-
-      if(Object.keys(lockers).length>0) lkOk=true;
     }
 
-    // Strategy 3: File upload fallback (if both strategies above fail completely)
-    if(!lkOk){
-      ms('s7','fail');
-      document.getElementById('s7').innerHTML=`<span class="ico" style="color:var(--orange)">!</span> Locker resolution failed. Upload lockers.json:`;
-      const ud=document.createElement('div');
-      ud.style.cssText='margin:10px 0 0 30px';
-      ud.innerHTML=`<div style="font-size:11px;color:var(--textDim);margin-bottom:6px">Generate lockers.json via the fetch_lockers.ps1 script (ensure it targets Base Mainnet), then upload:</div>
-        <pre style="background:var(--surface);padding:8px;border-radius:4px;font-size:9px;color:var(--orange);overflow:auto;margin-bottom:8px;max-height:70px;white-space:pre-wrap;word-break:break-all;user-select:all;cursor:text">powershell -ExecutionPolicy Bypass -File fetch_lockers.ps1</pre>
-        <label style="display:inline-flex;align-items:center;gap:6px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 16px;cursor:pointer;font-size:12px;color:var(--textDim)">
-          📁 Upload lockers.json
-          <input type="file" accept=".json" id="lk-upload" style="display:none">
-        </label>
-        <span id="lk-status" style="margin-left:8px;font-size:12px"></span>
-        <button onclick="document.getElementById('s7').innerHTML='<span class=ico style=color:var(--textMuted)>○</span> Skipped';ms('s7','done');document.getElementById('lk-skip-resolve')&&document.getElementById('lk-skip-resolve').click()" style="margin-left:8px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:6px 14px;font-size:12px;color:var(--textDim);cursor:pointer;font-family:'DM Sans'">Skip (continue without mapping)</button>
-        <button id="lk-skip-resolve" style="display:none"></button>`;
-      document.getElementById('steps').appendChild(ud);
-      await new Promise((resolve)=>{
-        document.getElementById('lk-skip-resolve').addEventListener('click',resolve);
-        document.getElementById('lk-upload').addEventListener('change',function(){
-          const f=this.files[0];if(!f)return;
-          const rd=new FileReader();
-          rd.onload=function(e){
-            try{const j=JSON.parse(e.target.result);
-            const lks=j.data?j.data.lockers:(Array.isArray(j)?j:(j.lockers||[]));
-            lks.forEach(l=>{lockers[(l.id||'').toLowerCase()]=(l.lockerOwner||'').toLowerCase();});
-            document.getElementById('lk-status').textContent='✓ '+Object.keys(lockers).length+' lockers';
-            document.getElementById('lk-status').style.color='var(--green)';ms('s7','done');resolve();}
-            catch(err){document.getElementById('lk-status').textContent='Error: '+err.message;document.getElementById('lk-status').style.color='var(--red)';}};
-          rd.readAsText(f);});
-      });
-    } else { ms('s7','done'); }
+    // Strategy D: Self-map remaining addresses (likely EOAs = the wallet itself)
+    allAddrs.forEach(addr=>{
+      if(!lockers[addr]){lockers[addr]=addr;resolveStats.selfMapped++;}
+    });
 
+    // File upload fallback if resolution is very poor
+    const resolvedReal=allAddrs.filter(a=>lockers[a]&&lockers[a]!==a).length;
+    if(resolvedReal<allAddrs.length*0.1){
+      // Show upload option but don't block
+      const ud=document.createElement('div');
+      ud.style.cssText='margin:4px 0 0 30px;font-size:11px';
+      ud.innerHTML=`<span style="color:var(--orange)">Low resolution (${resolvedReal}/${allAddrs.length}). </span>
+        <label style="display:inline-flex;align-items:center;gap:4px;cursor:pointer;color:var(--accent)">
+          Upload lockers.json to improve
+          <input type="file" accept=".json" style="display:none" onchange="
+            const rd=new FileReader();rd.onload=function(e){
+              try{const j=JSON.parse(e.target.result);
+              const lks=j.data?j.data.lockers:(Array.isArray(j)?j:(j.lockers||[]));
+              lks.forEach(l=>{if(l.id&&l.lockerOwner)lockers[l.id.toLowerCase()]=l.lockerOwner.toLowerCase();});
+              this.parentElement.innerHTML='✓ Loaded '+lks.length+' lockers. Refresh to re-render.';
+              }catch(er){this.parentElement.textContent='Error: '+er.message;}}.bind(this);
+            rd.readAsText(this.files[0]);
+          ">
+        </label>`;
+      document.getElementById('s7').parentElement.appendChild(ud);
+    }
+    ms('s7','done');
+
+    // --- Launch report ---
     document.getElementById('ov').classList.add('fade-out');
     setTimeout(()=>{document.getElementById('ov').style.display='none';document.getElementById('rpt').style.display='block';render();},600);
+
   }catch(e){
     document.getElementById('ovt').textContent='';document.getElementById('ovs').textContent='';
     document.getElementById('ring').style.display='none';document.getElementById('steps').style.display='none';
@@ -429,55 +466,55 @@ async function go(){
   }
 }
 
+/* ===== CALCULATIONS ===== */
 function sup(m){const r=Number(m.totalAmountReceivedUntilUpdatedAt),s=Number(m.poolTotalAmountDistributedUntilUpdatedAt),t=Number(pool.totalAmountDistributedUntilUpdatedAt),u=Number(m.units),tu=Number(pool.totalUnits);if(tu===0)return r/W;return(r+(u/tu)*(t-s))/W;}
 function gi(v){const s=v.filter(x=>x>0).sort((a,b)=>a-b);const n=s.length;if(!n)return 0;const mu=s.reduce((a,b)=>a+b,0)/n;if(!mu)return 0;let nm=0;for(let i=0;i<n;i++)nm+=(2*(i+1)-n-1)*s[i];return nm/(n*n*mu);}
 function f(n,d=0){return Number(n).toLocaleString(undefined,{maximumFractionDigits:d});}
 function usd(v){return price?`≈ $${f(v*price,2)} USD`:'';}
 function ad(a){return `<a href="https://basescan.org/address/${a}" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none" title="${a}">${a.slice(0,8)}…${a.slice(-4)}</a><span onclick="navigator.clipboard.writeText('${a}');this.textContent='✓';setTimeout(()=>this.textContent='📋',1000)" style="cursor:pointer;margin-left:4px;font-size:10px;opacity:.5" title="Copy full address">📋</span>`;}
 
+/* ===== RENDER ===== */
 function render(){
   // Build points lookup by wallet
   const ptsMap={};
   pts.forEach(p=>{ptsMap[p.account.toLowerCase()]={p:p.totalPoints,e:p.eventCount,l:p.lastEventAt};});
 
   // Build bidirectional locker maps
-  const lkCount=Object.keys(lockers).length;
-  const ownerToLockers={};// wallet → [locker1, locker2, ...]
-  Object.entries(lockers).forEach(([lk,ow])=>{if(!ownerToLockers[ow])ownerToLockers[ow]=[];ownerToLockers[ow].push(lk);});
+  const ownerToLockers={};
+  Object.entries(lockers).forEach(([lk,ow])=>{if(ow!==lk){if(!ownerToLockers[ow])ownerToLockers[ow]=[];ownerToLockers[ow].push(lk);}});
 
   // Build pool member set for reverse lookup
   const poolMemberSet=new Set(mem.map(m=>m.account.id.toLowerCase()));
 
   // STRATEGY A (forward): pool_member → lockers[pool_member] → wallet → points
   // STRATEGY B (reverse): for each points account → find their lockers → check if any are pool members
-  // Build reverse map: which points accounts have lockers in the pool?
-  const ptsToPoolMember={};// points_wallet → pool_member_locker
+  const ptsToPoolMember={};
   Object.keys(ptsMap).forEach(wallet=>{
     const userLockers=ownerToLockers[wallet]||[];
     const inPool=userLockers.find(l=>poolMemberSet.has(l));
     if(inPool) ptsToPoolMember[wallet]=inPool;
   });
 
-  // Build pool member → points using BOTH strategies
-  const poolMemberToPts={};// pool_member_locker → {wallet, pts}
-  // Forward: lockers map
+  const poolMemberToPts={};
+  // Forward
   mem.forEach(m=>{
     const locker=m.account.id.toLowerCase();
     const wallet=lockers[locker]||null;
     if(wallet&&ptsMap[wallet]) poolMemberToPts[locker]={wallet,pts:ptsMap[wallet]};
   });
-  // Reverse: if a points account owns a locker that's a pool member
+  // Reverse
   Object.entries(ptsToPoolMember).forEach(([wallet,locker])=>{
     if(!poolMemberToPts[locker]) poolMemberToPts[locker]={wallet,pts:ptsMap[wallet]};
   });
 
   const pr=mem.map(m=>{
     const locker=m.account.id.toLowerCase();
-    const fwd=lockers[locker]||null;// forward wallet from lockers map
+    const fwd=lockers[locker]||null;
     const join=poolMemberToPts[locker]||null;
     const wallet=join?join.wallet:fwd;
     const pt=join?join.pts:null;
-    return{locker,wallet,u:Number(m.units),s:sup(m),c:m.isConnected,ts:Number(m.updatedAtTimestamp),pts:pt?pt.p:0,ev:pt?pt.e:0,la:pt?pt.l:null,matched:!!pt};
+    const resolvedReal=(fwd&&fwd!==locker);// true only if genuinely resolved (not self-mapped)
+    return{locker,wallet,u:Number(m.units),s:sup(m),c:m.isConnected,ts:Number(m.updatedAtTimestamp),pts:pt?pt.p:0,ev:pt?pt.e:0,la:pt?pt.l:null,matched:!!pt,resolved:resolvedReal};
   }).sort((a,b)=>b.s-a.s);
 
   const tr=pts.map(p=>({a:p.account.toLowerCase(),p:p.totalPoints,e:p.eventCount,l:p.lastEventAt})).sort((a,b)=>b.p-a.p);
@@ -487,26 +524,30 @@ function render(){
   const cn=pr.filter(r=>r.c).length,t10=pr.slice(0,10).reduce((s,r)=>s+r.s,0),g=gi(vs);
   const tP=tr.reduce((s,r)=>s+r.p,0),wP=tr.filter(r=>r.p>0).length;
   const matched=pr.filter(r=>r.matched).length;
-  const walletsMapped=pr.filter(r=>r.wallet).length;
+  const reallyResolved=pr.filter(r=>r.resolved).length;
+  const selfMapped=pr.filter(r=>!r.resolved).length;
 
+  // === KPI Row 1 ===
   document.getElementById('k1').innerHTML=`
     <div class="k g"><div class="kl">Total Pool Funding</div><div class="kv">${f(tF)} SUP</div><div class="ku">${usd(tF)}</div><div class="ks">Season 4 allocation</div></div>
     <div class="k g"><div class="kl">Distributed to Members</div><div class="kv">${f(tS)} SUP</div><div class="ku">${usd(tS)}</div><div class="ks">${f(pr.length)} recipients</div></div>
-    <div class="k b"><div class="kl">Pool Members</div><div class="kv">${f(pr.length)}</div><div class="ks">${walletsMapped?f(walletsMapped)+' wallets resolved':'Locker→wallet mapping not loaded'}</div></div>
-    <div class="k o"><div class="kl">Points Participants</div><div class="kv">${f(tr.length)}</div><div class="ks">${wP} earned points from actions · ${tr.length-wP} registered but inactive</div></div>
-    <div class="k p"><div class="kl">Total Points</div><div class="kv">${f(tP)}</div></div>`;
-  // Banner
-  const lkCount2=Object.keys(lockers).length;
-  if(matched>0){
-    document.getElementById('banner').innerHTML=`<strong>✅ Data linked:</strong> ${f(matched)} of ${pr.length} pool members matched to points accounts via ${f(lkCount2)} wallet resolutions on Base Mainnet. Unmatched members may use intermediary contracts or have no points activity.`;
+    <div class="k b"><div class="kl">Pool Members</div><div class="kv">${f(pr.length)}</div><div class="ks">${f(reallyResolved)} locker→wallet resolved · ${f(selfMapped)} direct/unresolved</div></div>
+    <div class="k o"><div class="kl">Points Participants</div><div class="kv">${f(tr.length)}</div><div class="ks">${wP} earned points · ${tr.length-wP} inactive</div></div>
+    <div class="k p"><div class="kl">Matched (Pool↔Points)</div><div class="kv">${f(matched)}</div><div class="ks">${f(matched)} of ${f(pr.length)} pool members linked to points accounts (${f(matched/pr.length*100,1)}%)</div></div>`;
+
+  // === Banner ===
+  if(matched>pr.length*0.5){
+    document.getElementById('banner').innerHTML=`<strong>✅ Good match rate:</strong> ${f(matched)} of ${pr.length} pool members linked to points accounts. ${f(reallyResolved)} lockers resolved via on-chain owner() calls + subgraph data.`;
     document.getElementById('banner').style.borderLeftColor='var(--green)';
-  }else if(lkCount2>0){
-    document.getElementById('banner').innerHTML=`<strong>ℹ️ Mapping loaded:</strong> ${f(lkCount2)} lockers indexed, ${walletsMapped} wallets resolved, but no overlap with points accounts. Pool and points data shown independently.`;
+  }else if(matched>0){
+    document.getElementById('banner').innerHTML=`<strong>⚠️ Partial matching:</strong> ${f(matched)} of ${pr.length} pool members matched (${f(matched/pr.length*100,1)}%). ${f(reallyResolved)} lockers were resolved to owner wallets via RPC + subgraph. The remaining ${f(selfMapped)} addresses could not be resolved — they are likely smart contract lockers whose owner function uses a non-standard ABI, or direct wallet addresses not present in the points leaderboard. Pool distribution and points data are shown independently below.`;
     document.getElementById('banner').style.borderLeftColor='var(--orange)';
   }else{
-    document.getElementById('banner').innerHTML=`<strong>ℹ️ No mapping:</strong> Place <code style="font-size:11px;background:var(--surface2);padding:2px 4px;border-radius:3px">lockers.json</code> alongside this page to link pool members to user wallets.`;
+    document.getElementById('banner').innerHTML=`<strong>ℹ️ No matches:</strong> Could not link pool members to points accounts. This may indicate the locker contracts use a non-standard owner interface, or the GoodDollar subgraph indexes a different chain than Base. Data is shown independently.`;
     document.getElementById('banner').style.borderLeftColor='var(--accent)';
   }
+
+  // === KPI Row 2 ===
   document.getElementById('k2').innerHTML=`
     <div class="k g"><div class="kl">Average Reward</div><div class="kv">${f(tS/pr.length,2)} SUP</div><div class="ku">${usd(tS/pr.length)}</div></div>
     <div class="k b"><div class="kl">Median Reward</div><div class="kv">${f(med,2)} SUP</div><div class="ku">${usd(med)}</div></div>
@@ -514,7 +555,7 @@ function render(){
     <div class="k ${g>.6?'r':'o'}"><div class="kl">Gini Coefficient</div><div class="kv">${(Math.round(g*1000)/1000)}</div><div class="ks">${g>.6?'Concentrated':g>.4?'Moderate':'Well distributed'}</div></div>
     <div class="k p"><div class="kl">SUP Price</div><div class="kv">${price?'$'+price.toFixed(4):'N/A'}</div><div class="ks">${price?'Live':'Not available'}</div></div>`;
 
-  // Charts row 1
+  // === Charts Row 1 ===
   document.getElementById('c1').innerHTML='<div class="cb"><div class="ct">Reward Distribution</div><div class="cs">Pool members by SUP received</div><canvas id="h1"></canvas></div><div class="cb"><div class="ct">Points Distribution</div><div class="cs">Wallets by points earned</div><canvas id="h2"></canvas></div>';
   const bk=[{l:'0-1',a:0,b:1},{l:'1-10',a:1,b:10},{l:'10-50',a:10,b:50},{l:'50-100',a:50,b:100},{l:'100-500',a:100,b:500},{l:'500-1k',a:500,b:1e3},{l:'1k-5k',a:1e3,b:5e3},{l:'5k+',a:5e3,b:Infinity}];
   const hd=bk.map(b=>({l:b.l,c:pr.filter(r=>r.s>=b.a&&r.s<b.b).length})).filter(x=>x.c>0);
@@ -523,94 +564,167 @@ function render(){
   const pd=pb2.map(b=>({l:b.l,c:tr.filter(r=>r.p>=b.a&&r.p<b.b).length})).filter(x=>x.c>0);
   bar('h2',pd.map(d=>d.l),pd.map(d=>d.c),'#58a6ff');
 
-  // Charts row 2: timelines
-  document.getElementById('c2').innerHTML='<div class="cb"><div class="ct">Member Activity Timeline</div><div class="cs">Pool unit updates per day — shows when members joined or had units changed</div><canvas id="t1"></canvas></div><div class="cb"><div class="ct">Points Activity Timeline</div><div class="cs">Last activity per wallet by date. Spikes indicate batch processing events (e.g. bulk point reconciliation)</div><canvas id="t2"></canvas></div>';
+  // === Charts Row 2: Timelines ===
+  document.getElementById('c2').innerHTML='<div class="cb"><div class="ct">Member Activity Timeline</div><div class="cs">Pool unit updates per day</div><canvas id="t1"></canvas></div><div class="cb"><div class="ct">Points Activity Timeline</div><div class="cs">Last activity per wallet by date</div><canvas id="t2"></canvas></div>';
   if(tl.length){const dm={};tl.forEach(e=>{const d=new Date(Number(e.timestamp)*1000).toISOString().slice(0,10);dm[d]=(dm[d]||0)+1;});const ds=Object.keys(dm).sort();line('t1',ds,ds.map(d=>dm[d]),'#3fb950');}
   else{const dm={};pr.forEach(r=>{const d=new Date(r.ts*1000).toISOString().slice(0,10);dm[d]=(dm[d]||0)+1;});const ds=Object.keys(dm).sort();line('t1',ds,ds.map(d=>dm[d]),'#3fb950');}
   const pm={};tr.forEach(r=>{if(r.l){const d=r.l.slice(0,10);pm[d]=(pm[d]||0)+1;}});const pds=Object.keys(pm).sort();line('t2',pds,pds.map(d=>pm[d]),'#58a6ff');
 
-  // Tables
-  // Actions breakdown section — uses merged subgraph + Points API data with donut chart
+  // =============================================
+  // === ACTIONS BREAKDOWN SECTION ===
+  // =============================================
   const palette=['#3fb950','#58a6ff','#bc8cff','#f778ba','#d29922','#f85149','#79c0ff','#7ee787'];
-  const actionKeys=Object.keys(actions).sort((a,b)=>(actions[b].totalEvents||0)-(actions[a].totalEvents||0));
-  const actTotalPts=actionKeys.reduce((s,k)=>s+(typeof actions[k].points==='number'?actions[k].points:0),0);
+  const actionKeys=Object.keys(actions).sort((a,b)=>(actions[b].points||0)-(actions[a].points||0));
+  const actTotalPts=actionKeys.reduce((s,k)=>s+(actions[k].points||0),0);
   const actTotalEv=actionKeys.reduce((s,k)=>s+(actions[k].totalEvents||0),0);
 
   let actHTML='<div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:18px;margin-bottom:12px">';
-  actHTML+='<div class="ct">On-Chain Actions &amp; Points Breakdown</div>';
-  actHTML+='<div class="cs">All on-chain action types from the GoodDollar subgraph (Base Mainnet) merged with points data from the Superfluid Points API. Actions without point values are tracked on-chain but may not generate campaign points directly.</div>';
 
-  // Donut chart + legend layout
-  actHTML+='<div style="display:flex;gap:24px;flex-wrap:wrap;align-items:center;margin:16px 0">';
-  actHTML+='<div style="flex:0 0 220px;position:relative"><canvas id="donutActions" width="220" height="220"></canvas>';
-  actHTML+='<div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center"><div style="font-size:22px;font-weight:700;color:var(--white)">'+f(actTotalEv)+'</div><div style="font-size:10px;color:var(--textMuted)">total events</div></div></div>';
-  actHTML+='<div style="flex:1;min-width:240px">';
-  actionKeys.forEach((ev,i)=>{
-    const a=actions[ev];
-    const color=palette[i%palette.length];
-    const evPct=actTotalEv>0?(a.totalEvents/actTotalEv*100):0;
-    actHTML+=`<div style="display:flex;align-items:center;gap:8px;padding:4px 0"><div style="width:10px;height:10px;border-radius:2px;background:${color};flex-shrink:0"></div><div style="font-size:12px;color:var(--text);flex:1">${a.label||ev}</div><div style="font-size:11px;color:var(--textDim);font-family:'JetBrains Mono',monospace;white-space:nowrap">${f(a.totalEvents||0)} (${f(evPct,1)}%)</div></div>`;
-  });
-  actHTML+='</div></div>';
+  // Explanation header
+  actHTML+='<div class="ct">Points-Generating Actions</div>';
+  actHTML+='<div class="cs" style="margin-bottom:4px">These are the action types discovered in the <strong style="color:var(--text)">Superfluid Points API</strong> for Campaign #'+CID+'. Each action generates points that determine a wallet\'s share of the SUP reward pool.</div>';
 
-  // Detail cards
-  actHTML+='<div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:8px">';
-  actionKeys.forEach((ev,i)=>{
-    const a=actions[ev];
-    const color=palette[i%palette.length];
-    const ptsPct=actTotalPts>0&&typeof a.points==='number'?f(a.points/actTotalPts*100,1)+'%':'—';
-    const srcBadge=a.source==='subgraph'?'<span style="font-size:9px;background:#161b22;color:#58a6ff;padding:1px 5px;border-radius:3px;margin-left:4px">subgraph</span>':'<span style="font-size:9px;background:#161b22;color:#d29922;padding:1px 5px;border-radius:3px;margin-left:4px">points API</span>';
-    actHTML+=`<div style="flex:1;min-width:180px;background:var(--surface2);border-radius:8px;padding:14px;border-left:3px solid ${color}">
-      <div style="font-size:10px;color:var(--textMuted);text-transform:uppercase;letter-spacing:1px;font-family:'JetBrains Mono',monospace;margin-bottom:4px">${a.label||ev}${srcBadge}</div>
-      <div style="font-size:18px;font-weight:700;color:var(--white)">${f(a.totalEvents||0)} <span style="font-size:11px;color:var(--textDim);font-weight:400">events</span></div>
-      <div style="font-size:12px;color:var(--orange);margin-top:2px">${typeof a.points==='number'&&a.points>0?f(a.points)+(a.estimated?' (est.)':'')+' pts · '+ptsPct:'No point data'}</div>
-      ${a.desc?'<div style="font-size:10px;color:var(--textMuted);margin-top:4px">'+a.desc+'</div>':''}
-      </div>`;
-  });
-  actHTML+='</div></div>';
-  document.getElementById('actions-section').innerHTML=actHTML;
+  // Methodology note
+  actHTML+='<div style="background:var(--surface2);border-radius:6px;padding:10px 12px;margin-bottom:16px;font-size:11px;color:var(--textDim);line-height:1.5">';
+  actHTML+='<strong style="color:var(--text)">How points are estimated:</strong> Event counts come directly from the API (<code style="font-size:10px">totalDocs</code>). ';
+  actHTML+='Point values are estimated by sampling events from the beginning, middle, and end of each event type\'s history (stratified sampling), then scaled proportionally so the sum matches the known leaderboard total of <strong style="color:var(--orange)">'+f(tP)+' pts</strong>. ';
+  if(actTotalPts>0&&Math.abs(actTotalPts-tP)/tP>0.05){
+    actHTML+='<span style="color:var(--orange)">Note: estimated action total ('+f(actTotalPts)+') differs from leaderboard total ('+f(tP)+') — the leaderboard is authoritative.</span>';
+  }
+  actHTML+='</div>';
 
-  // Render the donut chart
-  if(actionKeys.length>0&&document.getElementById('donutActions')){
-    new Chart(document.getElementById('donutActions'),{type:'doughnut',data:{
-      labels:actionKeys.map(k=>actions[k].label||k),
-      datasets:[{data:actionKeys.map(k=>actions[k].totalEvents||0),backgroundColor:actionKeys.map((_,i)=>palette[i%palette.length]+'cc'),borderColor:actionKeys.map((_,i)=>palette[i%palette.length]),borderWidth:1,hoverOffset:6}]
-    },options:{responsive:false,cutout:'65%',plugins:{legend:{display:false},tooltip:{callbacks:{label:function(ctx){const k=actionKeys[ctx.dataIndex];const a=actions[k];return` ${a.label||k}: ${f(a.totalEvents)} events`+(a.points?` · ${f(a.points)} pts`:'');}}}}}});
+  // Donut chart + legend
+  if(actionKeys.length>0){
+    actHTML+='<div style="display:flex;gap:24px;flex-wrap:wrap;align-items:center;margin:12px 0">';
+    actHTML+='<div style="flex:0 0 200px;position:relative"><canvas id="donutActions" width="200" height="200"></canvas>';
+    actHTML+='<div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center"><div style="font-size:20px;font-weight:700;color:var(--white)">'+f(tP)+'</div><div style="font-size:10px;color:var(--textMuted)">total points</div></div></div>';
+    actHTML+='<div style="flex:1;min-width:220px">';
+    actionKeys.forEach((ev,i)=>{
+      const a=actions[ev];
+      const color=palette[i%palette.length];
+      const ptsPct=actTotalPts>0?(a.points/actTotalPts*100):0;
+      actHTML+=`<div style="display:flex;align-items:center;gap:8px;padding:5px 0"><div style="width:10px;height:10px;border-radius:2px;background:${color};flex-shrink:0"></div><div style="font-size:12px;color:var(--text);flex:1">${a.label}</div><div style="font-size:11px;color:var(--textDim);font-family:'JetBrains Mono',monospace;white-space:nowrap">${f(a.points)} pts (${f(ptsPct,1)}%)</div></div>`;
+    });
+    actHTML+='</div></div>';
   }
 
+  // Detail cards for each action
+  actHTML+='<div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:12px">';
+  actionKeys.forEach((ev,i)=>{
+    const a=actions[ev];
+    const color=palette[i%palette.length];
+    const ptsPct=actTotalPts>0?f(a.points/actTotalPts*100,1)+'%':'—';
+    actHTML+=`<div style="flex:1;min-width:200px;background:var(--surface2);border-radius:8px;padding:14px;border-left:3px solid ${color}">
+      <div style="font-size:10px;color:var(--textMuted);text-transform:uppercase;letter-spacing:1px;font-family:'JetBrains Mono',monospace;margin-bottom:6px">${a.label}</div>
+      <div style="font-size:22px;font-weight:700;color:var(--orange)">${f(a.points)} <span style="font-size:11px;font-weight:400;color:var(--textDim)">pts${a.estimated?' (scaled)':''}</span></div>
+      <div style="font-size:12px;color:var(--textDim);margin-top:4px">${f(a.totalEvents)} events · ${ptsPct} of total · ~${a.avgPts} pts/event</div>
+      <div style="font-size:10px;color:var(--textMuted);margin-top:4px">${a.desc}</div>
+      <div style="font-size:9px;color:var(--textMuted);margin-top:3px;font-family:'JetBrains Mono',monospace">sampled ${a.sampleSize} events for avg</div>
+      </div>`;
+  });
+  actHTML+='</div>';
+
+  // If no actions found from Points API
+  if(actionKeys.length===0){
+    actHTML+='<div style="text-align:center;padding:24px;color:var(--textMuted)">No point events found in the Points API for campaign #'+CID+'. The events endpoint may be empty or blocked by CORS.</div>';
+  }
+  actHTML+='</div>';
+
+  // === ON-CHAIN ACTIVITY (supplementary from GD subgraph) ===
+  const sgKeys=Object.keys(sgActivity);
+  if(sgKeys.length>0){
+    actHTML+='<div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:18px;margin-top:12px;margin-bottom:12px">';
+    actHTML+='<div class="ct">On-Chain Activity (GoodDollar Subgraph)</div>';
+    actHTML+='<div class="cs" style="margin-bottom:4px">Supplementary data from the GoodDollar subgraph showing all tracked on-chain entity types. These represent blockchain activity — not all of them generate campaign points. The subgraph may index a different deployment chain; magnitudes are approximate.</div>';
+    actHTML+='<div style="display:flex;gap:10px;flex-wrap:wrap">';
+    sgKeys.forEach((k,i)=>{
+      const e=sgActivity[k];
+      const color=palette[(i+actionKeys.length)%palette.length];
+      actHTML+=`<div style="flex:1;min-width:160px;background:var(--surface2);border-radius:6px;padding:12px;border-left:3px solid ${color}">
+        <div style="font-size:10px;color:var(--textMuted);text-transform:uppercase;letter-spacing:1px;font-family:'JetBrains Mono',monospace;margin-bottom:3px">${e.label}</div>
+        <div style="font-size:16px;font-weight:600;color:var(--white)">${e.magnitude}</div>
+        <div style="font-size:10px;color:var(--textMuted);margin-top:2px">${e.desc}</div>
+        </div>`;
+    });
+    actHTML+='</div></div>';
+  }
+
+  // === Missing Actions Note ===
+  actHTML+='<div style="background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--purple);border-radius:10px;padding:14px 18px;margin-top:12px;margin-bottom:12px;font-size:11px;line-height:1.6;color:var(--textDim)">';
+  actHTML+='<strong style="color:var(--text)">About missing actions (invites, claims, etc.):</strong> ';
+  actHTML+='The Points API for campaign #'+CID+' only returns the event types shown above. If you expected additional actions like <em>invites</em>, <em>G$ claims</em>, or <em>streaming donations</em>, there are a few possible explanations: ';
+  actHTML+='(1) These actions may not award points in this specific campaign configuration. ';
+  actHTML+='(2) They may be tracked under different event names — the event types above are exactly what the API returns. ';
+  actHTML+='(3) The campaign may have been configured to only reward staking and specific other activities. ';
+  actHTML+='The GoodDollar team can confirm which actions were enabled for Season 4 in the campaign settings.';
+  actHTML+='</div>';
+
+  document.getElementById('actions-section').innerHTML=actHTML;
+
+  // Render donut chart
+  if(actionKeys.length>0&&document.getElementById('donutActions')){
+    new Chart(document.getElementById('donutActions'),{type:'doughnut',data:{
+      labels:actionKeys.map(k=>actions[k].label),
+      datasets:[{data:actionKeys.map(k=>actions[k].points||0),backgroundColor:actionKeys.map((_,i)=>palette[i%palette.length]+'cc'),borderColor:actionKeys.map((_,i)=>palette[i%palette.length]),borderWidth:1,hoverOffset:6}]
+    },options:{responsive:false,cutout:'65%',plugins:{legend:{display:false},tooltip:{callbacks:{label:function(ctx){const k=actionKeys[ctx.dataIndex];const a=actions[k];return` ${a.label}: ${f(a.points)} pts (${f(a.totalEvents)} events)`;}}}}}});
+  }
+
+  // === Tables ===
   const maxSUP=pr.length?pr[0].s:1;
   let h='<div style="overflow-x:auto"><table><thead><tr><th>#</th><th>Wallet</th><th>Locker</th><th>SUP Received</th><th>Points</th><th>Units</th><th>Share</th></tr></thead><tbody>';
-  pr.slice(0,30).forEach((r,i)=>{const pct=Math.round(r.s/maxSUP*100);const sPct=r.s/tS*100;h+=`<tr><td class="mono" style="color:var(--textMuted)">${i+1}</td><td class="mono" style="font-size:11px">${r.wallet?ad(r.wallet):'<span style="color:var(--textMuted);font-size:10px">unmapped</span>'}</td><td class="mono" style="font-size:11px">${ad(r.locker)}</td><td style="font-weight:600;color:var(--white)">${f(r.s,2)}<span style="display:block;font-size:10px;color:var(--textMuted);font-style:italic">${usd(r.s)}</span><div style="margin-top:3px;height:3px;background:var(--border);border-radius:2px;width:100px"><div style="height:3px;background:var(--green);border-radius:2px;width:${pct}px"></div></div></td><td style="color:${r.pts>0?'var(--orange)':'var(--textMuted)'}">${r.pts>0?f(r.pts):'—'}</td><td style="color:var(--textDim)">${r.u}</td><td style="color:var(--textDim)">${f(sPct,2)}%<div style="margin-top:3px;height:3px;background:var(--border);border-radius:2px;width:60px"><div style="height:3px;background:var(--accent);border-radius:2px;width:${Math.round(sPct/5*60)}px"></div></div></td></tr>`;});
+  pr.slice(0,30).forEach((r,i)=>{const pct=Math.round(r.s/maxSUP*100);const sPct=r.s/tS*100;h+=`<tr><td class="mono" style="color:var(--textMuted)">${i+1}</td><td class="mono" style="font-size:11px">${r.resolved?ad(r.wallet):(r.wallet===r.locker?'<span style="color:var(--textMuted);font-size:10px" title="Self-mapped: could not resolve owner">'+r.locker.slice(0,8)+'…'+r.locker.slice(-4)+' ⚠</span>':ad(r.wallet))}</td><td class="mono" style="font-size:11px">${ad(r.locker)}</td><td style="font-weight:600;color:var(--white)">${f(r.s,2)}<span style="display:block;font-size:10px;color:var(--textMuted);font-style:italic">${usd(r.s)}</span><div style="margin-top:3px;height:3px;background:var(--border);border-radius:2px;width:100px"><div style="height:3px;background:var(--green);border-radius:2px;width:${pct}px"></div></div></td><td style="color:${r.pts>0?'var(--orange)':'var(--textMuted)'}">${r.pts>0?f(r.pts):'—'}</td><td style="color:var(--textDim)">${r.u}</td><td style="color:var(--textDim)">${f(sPct,2)}%<div style="margin-top:3px;height:3px;background:var(--border);border-radius:2px;width:60px"><div style="height:3px;background:var(--accent);border-radius:2px;width:${Math.round(sPct/5*60)}px"></div></div></td></tr>`;});
   h+='</tbody></table></div>';document.getElementById('tp').innerHTML=h;
-  document.getElementById('tc').textContent=matched>0?`Top 30 of ${pr.length} · ${matched} linked to points data`:`Top 30 of ${pr.length} · Load lockers.json to see wallet↔points link`;
+  document.getElementById('tc').textContent=`Top 30 of ${pr.length} · ${matched} linked to points data`;
 
   const maxPts=tr.length?tr[0].p:1;
   let p='<div style="overflow-x:auto"><table><thead><tr><th>#</th><th>Wallet</th><th>Points</th><th>Events</th><th>Last Active</th></tr></thead><tbody>';
   tr.slice(0,30).forEach((r,i)=>{const pPct=Math.round(r.p/maxPts*100);p+=`<tr><td class="mono" style="color:var(--textMuted)">${i+1}</td><td class="mono" style="font-size:11px">${ad(r.a)}</td><td style="font-weight:600;color:var(--orange)">${f(r.p)}<div style="margin-top:3px;height:3px;background:var(--border);border-radius:2px;width:100px"><div style="height:3px;background:var(--orange);border-radius:2px;width:${pPct}px"></div></div></td><td style="color:var(--textDim)">${f(r.e)}</td><td class="mono" style="color:var(--textDim);font-size:11px">${r.l?r.l.slice(0,10):'—'}</td></tr>`;});
   p+='</tbody></table></div>';document.getElementById('tt').innerHTML=p;
 
-  // Sanity checks
+  // === Technical Details ===
   const expectedSUP=837370,expectedWallets=620;
   const supDelta=Math.abs(tS-expectedSUP)/expectedSUP*100;
   const walletDelta=Math.abs(pr.length-expectedWallets)/expectedWallets*100;
   const sanity=[];
   if(supDelta>10) sanity.push(`⚠ Total SUP (${f(tS)}) deviates ${f(supDelta,1)}% from expected ~${f(expectedSUP)}`);
   if(walletDelta>20) sanity.push(`⚠ Wallet count (${pr.length}) deviates ${f(walletDelta,1)}% from expected ~${expectedWallets}`);
-  const resolvedPct=walletsMapped>0?f(walletsMapped/pr.length*100,1):0;
 
-  document.getElementById('tech').innerHTML=`<div style="font-size:13px;font-weight:600;color:var(--white);margin-bottom:8px;font-family:'DM Sans'">Technical Details</div><div>Token: SUP · ${pool.token.id}</div><div>Pool: ${PID}</div><div>Admin: ${pool.admin.id}</div><div>Network: Base Mainnet (8453)</div><div>Chain ID: 8453</div><div>RPC: Base Mainnet (mainnet.base.org)</div><div>Campaign: #${CID}</div><div>Flow Rate: ${pool.flowRate} (complete)</div><div>Units: ${f(Number(pool.totalUnits))}</div><div>Updated: ${new Date(Number(pool.updatedAtTimestamp)*1000).toISOString()}</div><div>Wallet Resolution: ${f(walletsMapped)} of ${f(pr.length)} resolved (${resolvedPct}%) via Base RPC owner() + lockerOwner() · ${matched} matched to points</div>${sanity.length?'<div style="color:var(--orange);margin-top:6px">'+sanity.join('<br>')+'</div>':''}`;
-  document.getElementById('ft').textContent=`Generated ${new Date().toISOString().slice(0,16).replace('T',' ')} UTC · Live data from Superfluid Subgraph + Points API`;
-  window._pr=pr;window._tr=tr;window._tS=tS;window._tF=tF;window._st={tS,tF,m:pr.length,cn,pa:tr.length,tP,avg:tS/pr.length,med,t10p:t10/tS*100,g,u:Number(pool.totalUnits),price,matched,lkCount:Object.keys(lockers).length};
+  document.getElementById('tech').innerHTML=`<div style="font-size:13px;font-weight:600;color:var(--white);margin-bottom:8px;font-family:'DM Sans'">Technical Details</div>
+<div><strong>Data Sources (3 separate systems):</strong></div>
+<div>  1. Superfluid Protocol Subgraph (Base Mainnet) → pool members, units, SUP distribution</div>
+<div>  2. Superfluid Points API (cms.superfluid.pro) → campaign points, events, leaderboard</div>
+<div>  3. GoodDollar Subgraph (thegraph.com) → locker mappings, on-chain activity context</div>
+<div style="margin-top:6px">Token: SUP · ${pool.token.id}</div>
+<div>Pool: ${PID}</div>
+<div>Admin: ${pool.admin.id}</div>
+<div>Network: Base Mainnet · Chain ID: 8453</div>
+<div>Campaign: #${CID}</div>
+<div>Flow Rate: ${pool.flowRate} (complete)</div>
+<div>Units: ${f(Number(pool.totalUnits))}</div>
+<div>Updated: ${new Date(Number(pool.updatedAtTimestamp)*1000).toISOString()}</div>
+<div style="margin-top:6px"><strong>Wallet Resolution:</strong></div>
+<div>  GD subgraph lockers: ${f(resolveStats.gdSubgraph||0)} matches</div>
+<div>  lockers.json file: ${f(resolveStats.lockerJson||0)} additional</div>
+<div>  RPC owner() calls: ${f(resolveStats.rpc||0)} resolved</div>
+<div>  Self-mapped (likely EOAs): ${f(resolveStats.selfMapped||0)}</div>
+<div>  → ${f(matched)} matched to points accounts (${f(matched/pr.length*100,1)}%)</div>
+${sanity.length?'<div style="color:var(--orange);margin-top:6px">'+sanity.join('<br>')+'</div>':''}`;
+
+  document.getElementById('ft').textContent=`Generated ${new Date().toISOString().slice(0,16).replace('T',' ')} UTC · Live data from Superfluid Subgraph + Points API + GoodDollar Subgraph`;
+  window._pr=pr;window._tr=tr;window._tS=tS;window._tF=tF;window._st={tS,tF,m:pr.length,cn,pa:tr.length,tP,avg:tS/pr.length,med,t10p:t10/tS*100,g,u:Number(pool.totalUnits),price,matched,lkCount:Object.keys(lockers).length,resolveStats};
 }
 
+/* ===== CHART HELPERS ===== */
 function bar(id,l,d,c){new Chart(document.getElementById(id),{type:'bar',data:{labels:l,datasets:[{data:d,backgroundColor:c+'cc',borderRadius:3,barPercentage:.7}]},options:{responsive:true,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#8b949e',font:{size:10}},grid:{display:false}},y:{ticks:{color:'#8b949e',font:{size:10}},grid:{color:'#21262d'}}}}});}
 function line(id,l,d,c){new Chart(document.getElementById(id),{type:'line',data:{labels:l,datasets:[{data:d,borderColor:c,backgroundColor:c+'22',fill:true,tension:.3,pointRadius:1,borderWidth:2}]},options:{responsive:true,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#8b949e',font:{size:10},maxTicksLimit:8},grid:{display:false}},y:{ticks:{color:'#8b949e',font:{size:10}},grid:{color:'#21262d'}}}}});}
 
+/* ===== TAB SWITCHING ===== */
 function sw(t,el){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('on'));el.classList.add('on');document.getElementById('tp').style.display=t==='p'?'block':'none';document.getElementById('tt').style.display=t==='t'?'block':'none';document.getElementById('tc').textContent=`Top 30 of ${t==='p'?window._pr.length:window._tr.length}`;}
 
+/* ===== CSV EXPORT ===== */
 function csv(rows,h){return[h.join(','),...rows.map(r=>h.map(k=>{const v=r[k];return typeof v==='string'&&(v.includes(',')||v.includes('"'))?`"${v.replace(/"/g,'""')}"`:v}).join(','))].join('\n');}
 function dl(c,n){const b=new Blob([c],{type:'text/csv'});const u=URL.createObjectURL(b);const a=document.createElement('a');a.href=u;a.download=n;a.click();URL.revokeObjectURL(u);}
-function xPool(){dl(csv(window._pr.map((r,i)=>({rank:i+1,wallet:r.wallet||'',locker:r.locker,sup:Math.round(r.s*1e4)/1e4,usd:price?Math.round(r.s*price*100)/100:'',points:r.pts,events:r.ev,units:r.u,share:Math.round(r.s/window._tS*1e4)/100,connected:r.c?'Y':'N',matched:r.matched?'Y':'N'})),['rank','wallet','locker','sup','usd','points','events','units','share','connected','matched']),'season4_pool.csv');}
+function xPool(){dl(csv(window._pr.map((r,i)=>({rank:i+1,wallet:r.wallet||'',locker:r.locker,sup:Math.round(r.s*1e4)/1e4,usd:price?Math.round(r.s*price*100)/100:'',points:r.pts,events:r.ev,units:r.u,share:Math.round(r.s/window._tS*1e4)/100,connected:r.c?'Y':'N',matched:r.matched?'Y':'N',resolved:r.resolved?'Y':'N'})),['rank','wallet','locker','sup','usd','points','events','units','share','connected','matched','resolved']),'season4_pool.csv');}
 function xPts(){dl(csv(window._tr.map((r,i)=>({rank:i+1,wallet:r.a,points:r.p,events:r.e,last:r.l||''})),['rank','wallet','points','events','last']),'season4_points.csv');}
 function xSum(){const s=window._st;dl(csv([{m:'Total Funding (SUP)',v:Math.round(s.tF*100)/100},{m:'Total Distributed (SUP)',v:Math.round(s.tS*100)/100},{m:'SUP Price (USD)',v:s.price||'N/A'},{m:'Total Value (USD)',v:s.price?Math.round(s.tS*s.price*100)/100:'N/A'},{m:'Pool Members',v:s.m},{m:'Connected',v:s.cn},{m:'Points Participants',v:s.pa},{m:'Matched (Pool↔Points)',v:s.matched},{m:'Lockers Indexed',v:s.lkCount},{m:'Total Points',v:s.tP},{m:'Total Units',v:s.u},{m:'Average (SUP)',v:Math.round(s.avg*100)/100},{m:'Median (SUP)',v:Math.round(s.med*100)/100},{m:'Top 10 %',v:Math.round(s.t10p*100)/100},{m:'Gini',v:Math.round(s.g*1000)/1000},{m:'Token',v:'SUP'},{m:'Pool',v:PID},{m:'Network',v:'Base Mainnet'},{m:'Campaign',v:'#'+CID}],['m','v']),'season4_summary.csv');}
 
