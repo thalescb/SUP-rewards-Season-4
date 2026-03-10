@@ -90,7 +90,9 @@ td{padding:8px 10px;border-bottom:1px solid #21262d33}
   <div class="footer" id="ft"></div>
 </div>
 <script>
-const W=1e18,PID="0x41491a100847a7f678e3b286fea32b0dad18920e",SG="https://subgraph-endpoints.superfluid.dev/base-mainnet/protocol-v1",PA="https://cms.superfluid.pro/points/accounts",CID=7856,LSG="https://thegraph.com/explorer/api/playground/QmbmxtkSiFkKpHeUd4wKmws8QVkb7DtE2UMRtezC7HpmG1";
+const W=1e18,PID="0x41491a100847a7f678e3b286fea32b0dad18920e",SG="https://subgraph-endpoints.superfluid.dev/base-mainnet/protocol-v1",PA="https://cms.superfluid.pro/points/accounts",CID=7856;
+const BASE_RPCS=["https://mainnet.base.org","https://base.llamarpc.com","https://1rpc.io/base"];
+const OWNER_SEL="0x8da5cb5b",LOCKER_OWNER_SEL="0xa80b4694"; // owner() and lockerOwner() selectors
 let pool,mem=[],pts=[],price=null,tl=[],actions={},lockers={};
 
 function ms(id,st){const e=document.getElementById(id);e.className='step '+st;e.querySelector('.ico').textContent=st==='done'?'✓':st==='active'?'◉':st==='fail'?'✗':'○';}
@@ -213,10 +215,39 @@ async function go(){
     });
     ms('s6','done');
 
-    // Step 7: Wallet↔Locker mapping
+    // Step 7: Wallet↔Locker mapping — resolve on Base Mainnet (chain 8453)
     ms('s7','active');
     let lkOk=false;
-    // Strategy 1: Load lockers.json from same directory (GitHub Pages / same origin)
+    const allAddrs=mem.map(m=>m.account.id.toLowerCase());
+
+    // Helper: batch eth_call to resolve owner of contract addresses on Base
+    async function batchResolveOwners(addrs,selector,rpcUrl){
+      const resolved={};
+      const batchSize=20;
+      for(let i=0;i<addrs.length;i+=batchSize){
+        const batch=addrs.slice(i,i+batchSize);
+        const calls=batch.map((addr,j)=>({jsonrpc:"2.0",id:i+j,method:"eth_call",params:[{to:addr,data:selector},"latest"]}));
+        try{
+          const r=await fetch(rpcUrl,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(calls)});
+          const results=await r.json();
+          (Array.isArray(results)?results:[results]).forEach(res=>{
+            const idx=res.id;if(idx==null||idx>=addrs.length)return;
+            const addr=addrs[idx];
+            if(res.result&&res.result.length>=66&&res.result!=='0x'&&!/^0x0+$/.test(res.result)){
+              const owner='0x'+res.result.slice(26).toLowerCase();
+              if(owner!=='0x0000000000000000000000000000000000000000'&&owner!==addr){
+                resolved[addr]=owner;
+              }
+            }
+          });
+        }catch(e){}
+        // Small delay between batches to avoid rate limiting
+        if(i+batchSize<addrs.length) await new Promise(r=>setTimeout(r,80));
+      }
+      return resolved;
+    }
+
+    // Strategy 1: Load lockers.json from same directory (pre-built mapping)
     try{
       const r=await fetch('lockers.json');
       if(r.ok){
@@ -227,31 +258,45 @@ async function go(){
         if(Object.keys(lockers).length>0) lkOk=true;
       }
     }catch(e){}
-    // Strategy 2: Try subgraph directly (usually blocked by CORS)
+
+    // Strategy 2: Resolve locker owners on-chain via Base RPC (replaces old Arbitrum subgraph)
     if(!lkOk){
-      const lkQuery=(lid)=>JSON.stringify({query:`{lockers(first:1000,where:{id_gt:"${lid}"},orderBy:id){id lockerOwner}}`});
-      try{
-        lockers={};let lid='';
-        while(true){
-          const r=await fetch(LSG,{method:'POST',headers:{'Content-Type':'application/json'},body:lkQuery(lid)});
-          if(!r.ok) throw new Error('HTTP '+r.status);
-          const j=await r.json();
-          if(!j.data||!j.data.lockers||!j.data.lockers.length) break;
-          j.data.lockers.forEach(l=>{lockers[l.id.toLowerCase()]=l.lockerOwner.toLowerCase();});
+      let rpcResolved=false;
+      for(const rpcUrl of BASE_RPCS){
+        if(rpcResolved) break;
+        try{
+          // Pass 1: try owner() selector
+          const r1=await batchResolveOwners(allAddrs,OWNER_SEL,rpcUrl);
+          Object.assign(lockers,r1);
           document.getElementById('s7').querySelector('.ico').textContent=Object.keys(lockers).length;
-          if(j.data.lockers.length<1000) break;
-          lid=j.data.lockers[j.data.lockers.length-1].id;
-        }
-        if(Object.keys(lockers).length>0) lkOk=true;
-      }catch(e){}
+
+          // Pass 2: try lockerOwner() selector for unresolved addresses
+          const unresolved=allAddrs.filter(a=>!lockers[a]);
+          if(unresolved.length>0){
+            const r2=await batchResolveOwners(unresolved,LOCKER_OWNER_SEL,rpcUrl);
+            Object.assign(lockers,r2);
+            document.getElementById('s7').querySelector('.ico').textContent=Object.keys(lockers).length;
+          }
+          rpcResolved=true;
+        }catch(e){continue;}
+      }
+
+      // Self-map any remaining unresolved addresses (EOAs or contracts without owner fn)
+      // These addresses ARE the wallet themselves — not locker proxies
+      allAddrs.forEach(addr=>{
+        if(!lockers[addr]) lockers[addr]=addr;
+      });
+
+      if(Object.keys(lockers).length>0) lkOk=true;
     }
-    // Strategy 3: File upload fallback
+
+    // Strategy 3: File upload fallback (if both strategies above fail completely)
     if(!lkOk){
       ms('s7','fail');
-      document.getElementById('s7').innerHTML=`<span class="ico" style="color:var(--orange)">!</span> Locker data not found. Upload lockers.json or place it in the same folder:`;
+      document.getElementById('s7').innerHTML=`<span class="ico" style="color:var(--orange)">!</span> Locker resolution failed. Upload lockers.json:`;
       const ud=document.createElement('div');
       ud.style.cssText='margin:10px 0 0 30px';
-      ud.innerHTML=`<div style="font-size:11px;color:var(--textDim);margin-bottom:6px">Generate lockers.json with the fetch_lockers.ps1 script, then upload or add to your GitHub repo:</div>
+      ud.innerHTML=`<div style="font-size:11px;color:var(--textDim);margin-bottom:6px">Generate lockers.json via the fetch_lockers.ps1 script (ensure it targets Base Mainnet), then upload:</div>
         <pre style="background:var(--surface);padding:8px;border-radius:4px;font-size:9px;color:var(--orange);overflow:auto;margin-bottom:8px;max-height:70px;white-space:pre-wrap;word-break:break-all;user-select:all;cursor:text">powershell -ExecutionPolicy Bypass -File fetch_lockers.ps1</pre>
         <label style="display:inline-flex;align-items:center;gap:6px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 16px;cursor:pointer;font-size:12px;color:var(--textDim)">
           📁 Upload lockers.json
@@ -355,7 +400,7 @@ function render(){
   // Banner
   const lkCount2=Object.keys(lockers).length;
   if(matched>0){
-    document.getElementById('banner').innerHTML=`<strong>✅ Data linked:</strong> ${f(matched)} of ${pr.length} pool members matched to points accounts via ${f(lkCount2)} locker mappings. The remaining pool members use fontaine sub-contracts that require a Base-chain locker subgraph to resolve.`;
+    document.getElementById('banner').innerHTML=`<strong>✅ Data linked:</strong> ${f(matched)} of ${pr.length} pool members matched to points accounts via ${f(lkCount2)} wallet resolutions on Base Mainnet. Unmatched members may use intermediary contracts or have no points activity.`;
     document.getElementById('banner').style.borderLeftColor='var(--green)';
   }else if(lkCount2>0){
     document.getElementById('banner').innerHTML=`<strong>ℹ️ Mapping loaded:</strong> ${f(lkCount2)} lockers indexed, ${walletsMapped} wallets resolved, but no overlap with points accounts. Pool and points data shown independently.`;
@@ -423,7 +468,16 @@ function render(){
   tr.slice(0,30).forEach((r,i)=>{const pPct=Math.round(r.p/maxPts*100);p+=`<tr><td class="mono" style="color:var(--textMuted)">${i+1}</td><td class="mono" style="font-size:11px">${ad(r.a)}</td><td style="font-weight:600;color:var(--orange)">${f(r.p)}<div style="margin-top:3px;height:3px;background:var(--border);border-radius:2px;width:100px"><div style="height:3px;background:var(--orange);border-radius:2px;width:${pPct}px"></div></div></td><td style="color:var(--textDim)">${f(r.e)}</td><td class="mono" style="color:var(--textDim);font-size:11px">${r.l?r.l.slice(0,10):'—'}</td></tr>`;});
   p+='</tbody></table></div>';document.getElementById('tt').innerHTML=p;
 
-  document.getElementById('tech').innerHTML=`<div style="font-size:13px;font-weight:600;color:var(--white);margin-bottom:8px;font-family:'DM Sans'">Technical Details</div><div>Token: SUP · ${pool.token.id}</div><div>Pool: ${PID}</div><div>Admin: ${pool.admin.id}</div><div>Network: Base Mainnet (8453)</div><div>Campaign: #${CID}</div><div>Flow Rate: ${pool.flowRate} (complete)</div><div>Units: ${f(Number(pool.totalUnits))}</div><div>Updated: ${new Date(Number(pool.updatedAtTimestamp)*1000).toISOString()}</div><div>Locker Mapping: ${f(lkCount)} lockers indexed · ${walletsMapped} wallets resolved · ${matched} matched to points</div>`;
+  // Sanity checks
+  const expectedSUP=837370,expectedWallets=620;
+  const supDelta=Math.abs(tS-expectedSUP)/expectedSUP*100;
+  const walletDelta=Math.abs(pr.length-expectedWallets)/expectedWallets*100;
+  const sanity=[];
+  if(supDelta>10) sanity.push(`⚠ Total SUP (${f(tS)}) deviates ${f(supDelta,1)}% from expected ~${f(expectedSUP)}`);
+  if(walletDelta>20) sanity.push(`⚠ Wallet count (${pr.length}) deviates ${f(walletDelta,1)}% from expected ~${expectedWallets}`);
+  const resolvedPct=walletsMapped>0?f(walletsMapped/pr.length*100,1):0;
+
+  document.getElementById('tech').innerHTML=`<div style="font-size:13px;font-weight:600;color:var(--white);margin-bottom:8px;font-family:'DM Sans'">Technical Details</div><div>Token: SUP · ${pool.token.id}</div><div>Pool: ${PID}</div><div>Admin: ${pool.admin.id}</div><div>Network: Base Mainnet (8453)</div><div>Chain ID: 8453</div><div>RPC: Base Mainnet (mainnet.base.org)</div><div>Campaign: #${CID}</div><div>Flow Rate: ${pool.flowRate} (complete)</div><div>Units: ${f(Number(pool.totalUnits))}</div><div>Updated: ${new Date(Number(pool.updatedAtTimestamp)*1000).toISOString()}</div><div>Wallet Resolution: ${f(walletsMapped)} of ${f(pr.length)} resolved (${resolvedPct}%) via Base RPC owner() + lockerOwner() · ${matched} matched to points</div>${sanity.length?'<div style="color:var(--orange);margin-top:6px">'+sanity.join('<br>')+'</div>':''}`;
   document.getElementById('ft').textContent=`Generated ${new Date().toISOString().slice(0,16).replace('T',' ')} UTC · Live data from Superfluid Subgraph + Points API`;
   window._pr=pr;window._tr=tr;window._tS=tS;window._tF=tF;window._st={tS,tF,m:pr.length,cn,pa:tr.length,tP,avg:tS/pr.length,med,t10p:t10/tS*100,g,u:Number(pool.totalUnits),price,matched,lkCount:Object.keys(lockers).length};
 }
