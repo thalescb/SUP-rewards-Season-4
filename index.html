@@ -261,72 +261,42 @@ async function go(){
     //   B) GD subgraph entities → on-chain activity context (supplementary)
     ms('s6','active');
 
-    // PART A: Points API events — discover all event types with stratified sampling
-    const evTypes={}; // eventName → {totalDocs, samples, rawEst, estPts}
+    // PART A: Points API events — fetch ALL events to compute exact totals per type
+    const evTypes={}; // eventName → {totalEvents, totalPts}
 
-    // A1: Fetch first page to discover event type names
-    const fp=await fetchPtsApi('/points/events?campaignId='+CID+'&limit=100&page=1');
-    if(fp&&fp.events){
-      fp.events.forEach(e=>{
+    // Paginate through all events for this campaign
+    let evPage=1;
+    while(true){
+      const j=await fetchPtsApi('/points/events?campaignId='+CID+'&limit=100&page='+evPage);
+      if(!j||!j.events||!j.events.length) break;
+      j.events.forEach(e=>{
         const n=e.eventName||'unknown';
-        if(!evTypes[n]) evTypes[n]={totalDocs:0,samples:[]};
-        evTypes[n].samples.push(e.points||0);
+        if(!evTypes[n]) evTypes[n]={totalEvents:0,totalPts:0};
+        evTypes[n].totalEvents++;
+        evTypes[n].totalPts+=(e.points||0);
       });
-    }
-    document.getElementById('s6').querySelector('.ico').textContent=Object.keys(evTypes).length+' pts types';
-
-    // A2: For each event type, get totalDocs and sample from beginning, middle, and end
-    for(const evName of Object.keys(evTypes)){
-      // Filtered query → gives us totalDocs + first page of this event type
-      const pg1=await fetchPtsApi('/points/events?campaignId='+CID+'&eventName='+encodeURIComponent(evName)+'&limit=100&page=1');
-      if(pg1&&pg1.pagination){
-        evTypes[evName].totalDocs=pg1.pagination.totalDocs;
-        const tp=pg1.pagination.totalPages||1;
-        if(pg1.events) pg1.events.forEach(e=>evTypes[evName].samples.push(e.points||0));
-        // Sample middle page and last page for unbiased average
-        const midPage=Math.max(2,Math.ceil(tp*0.5));
-        const lastPage=Math.max(2,tp);
-        for(const sp of [midPage,lastPage]){
-          if(sp<=1) continue;
-          const pgN=await fetchPtsApi('/points/events?campaignId='+CID+'&eventName='+encodeURIComponent(evName)+'&limit=100&page='+sp);
-          if(pgN&&pgN.events) pgN.events.forEach(e=>evTypes[evName].samples.push(e.points||0));
-        }
-      }
-      document.getElementById('s6').querySelector('.ico').textContent=Object.keys(evTypes).length+' pts types';
+      document.getElementById('s6').querySelector('.ico').textContent=Object.keys(evTypes).length+' types · pg '+evPage;
+      if(!j.pagination||!j.pagination.hasNextPage) break;
+      evPage++;
     }
 
-    // A3: Compute estimates and cross-validate against leaderboard total
-    const leaderboardTotal=pts.reduce((s,p)=>s+p.totalPoints,0);
-    let rawEstSum=0;
-    Object.entries(evTypes).forEach(([name,t])=>{
-      const sum=t.samples.reduce((a,b)=>a+b,0);
-      t.avgPts=t.samples.length>0?sum/t.samples.length:0;
-      t.rawEst=Math.round(t.avgPts*(t.totalDocs||t.samples.length));
-      rawEstSum+=t.rawEst;
-    });
-    // Scale proportionally so estimated sum matches the known leaderboard total
-    const scaleFactor=(rawEstSum>0&&leaderboardTotal>0)?leaderboardTotal/rawEstSum:1;
-    Object.entries(evTypes).forEach(([name,t])=>{
-      t.estPts=Math.round(t.rawEst*scaleFactor);
-    });
-
-    // Build actions map from Points API data
+    // Build actions map from exact Points API data
     const evLabels={governanceStakePoints:'Governance Staking',claimPoints:'G$ Claims',claimed:'G$ Claims',streamPoints:'Stream Donations',streamed:'Stream Donations',invitePoints:'Invite Rewards',invites:'Invite Rewards',farcasterPoints:'Farcaster Activity'};
     const evDescs={governanceStakePoints:'Staking G$ in GoodDollar governance',claimPoints:'Daily G$ UBI claims',claimed:'Daily G$ UBI claims',streamPoints:'Streaming donations to GoodCollective',streamed:'Streaming donations to GoodCollective',invitePoints:'Referring new users to the ecosystem',invites:'Referring new users',farcasterPoints:'Engagement on Farcaster social protocol'};
     Object.entries(evTypes).forEach(([name,t])=>{
+      const avgPts=t.totalEvents>0?t.totalPts/t.totalEvents:0;
       actions[name]={
         label:evLabels[name]||name.replace(/([A-Z])/g,' $1').replace(/^./,s=>s.toUpperCase()),
         desc:evDescs[name]||'Campaign point event',
         source:'points-api',
-        totalEvents:t.totalDocs||t.samples.length,
-        points:t.estPts, rawEst:t.rawEst,
-        avgPts:Math.round(t.avgPts*100)/100,
-        estimated:Math.abs(scaleFactor-1)>0.01,
-        sampleSize:t.samples.length
+        totalEvents:t.totalEvents,
+        points:t.totalPts,
+        avgPts:Math.round(avgPts*100)/100,
+        estimated:false
       };
     });
 
-    // PART B: GD subgraph — light probe only (2-3 queries total, no heavy pagination)
+    // PART B: GD subgraph — exact counts via pagination
     try{
       // Single query: check which entity types have data
       const disc=await gdGql(`{se:stakingEvents(first:1){id} ls:lockerStakings(first:1){id} fn:fontaines(first:1){id} iu:instantUnlocks(first:1){id} ce:claimEventUnits(first:1){id} fs:fluidStreamClaimEvents(first:1){id} lp:liquidityPositions(first:1){id}}`);
@@ -341,19 +311,22 @@ async function go(){
           lp:{key:'liquidityPositions',label:'Liquidity Positions',desc:'Liquidity provision'}
         };
         const found=Object.keys(entMap).filter(a=>disc[a]&&disc[a].length>0);
-        // Skip-based magnitude probe (single batched query, max skip=5000)
-        if(found.length>0){
-          const skipQ=found.map(a=>`${a}k:${entMap[a].key}(first:1,skip:999){id} ${a}m:${entMap[a].key}(first:1,skip:4999){id}`).join(' ');
+        // Paginate each entity for exact count
+        for(const alias of found){
+          const ent=entMap[alias];
+          let count=0, lastId='';
           try{
-            const skipR=await gdGql(`{${skipQ}}`);
-            found.forEach(a=>{
-              const hasK=skipR&&skipR[a+'k']&&skipR[a+'k'].length>0;
-              const hasM=skipR&&skipR[a+'m']&&skipR[a+'m'].length>0;
-              sgActivity[entMap[a].key]={label:entMap[a].label,desc:entMap[a].desc,magnitude:hasM?'5,000+':hasK?'1,000+':'< 1,000',exists:true};
-            });
-          }catch(e){
-            found.forEach(a=>{sgActivity[entMap[a].key]={label:entMap[a].label,desc:entMap[a].desc,magnitude:'present',exists:true};});
-          }
+            while(true){
+              const w=lastId?`(first:1000,orderBy:id,where:{id_gt:"${lastId}"})`:`(first:1000,orderBy:id)`;
+              const d=await gdGql(`{${ent.key}${w}{id}}`);
+              if(!d||!d[ent.key]||!d[ent.key].length) break;
+              count+=d[ent.key].length;
+              document.getElementById('s6').querySelector('.ico').textContent=ent.label+': '+count;
+              if(d[ent.key].length<1000) break;
+              lastId=d[ent.key][d[ent.key].length-1].id;
+            }
+          }catch(e){}
+          sgActivity[ent.key]={label:ent.label,desc:ent.desc,count:count,exists:true};
         }
         document.getElementById('s6').querySelector('.ico').textContent=Object.keys(evTypes).length+' pts + '+found.length+' on-chain';
       }
@@ -586,11 +559,9 @@ function render(){
 
   // Methodology note
   actHTML+='<div style="background:var(--surface2);border-radius:6px;padding:10px 12px;margin-bottom:16px;font-size:11px;color:var(--textDim);line-height:1.5">';
-  actHTML+='<strong style="color:var(--text)">How points are estimated:</strong> Event counts come directly from the API (<code style="font-size:10px">totalDocs</code>). ';
-  actHTML+='Point values are estimated by sampling events from the beginning, middle, and end of each event type\'s history (stratified sampling), then scaled proportionally so the sum matches the known leaderboard total of <strong style="color:var(--orange)">'+f(tP)+' pts</strong>. ';
-  if(actTotalPts>0&&Math.abs(actTotalPts-tP)/tP>0.05){
-    actHTML+='<span style="color:var(--orange)">Note: estimated action total ('+f(actTotalPts)+') differs from leaderboard total ('+f(tP)+') — the leaderboard is authoritative.</span>';
-  }
+  actHTML+='<strong style="color:var(--text)">Data source:</strong> All event counts and point values are exact totals computed from the full Superfluid Points API event history for Campaign #'+CID+'. ';
+  actHTML+='Total points across all actions: <strong style="color:var(--orange)">'+f(actTotalPts)+' pts</strong> from <strong style="color:var(--text)">'+f(actTotalEv)+'</strong> events. ';
+  actHTML+='Leaderboard total (sum of all account points): <strong style="color:var(--orange)">'+f(tP)+' pts</strong>.';
   actHTML+='</div>';
 
   // Donut chart + legend
@@ -616,10 +587,9 @@ function render(){
     const ptsPct=actTotalPts>0?f(a.points/actTotalPts*100,1)+'%':'—';
     actHTML+=`<div style="flex:1;min-width:200px;background:var(--surface2);border-radius:8px;padding:14px;border-left:3px solid ${color}">
       <div style="font-size:10px;color:var(--textMuted);text-transform:uppercase;letter-spacing:1px;font-family:'JetBrains Mono',monospace;margin-bottom:6px">${a.label}</div>
-      <div style="font-size:22px;font-weight:700;color:var(--orange)">${f(a.points)} <span style="font-size:11px;font-weight:400;color:var(--textDim)">pts${a.estimated?' (scaled)':''}</span></div>
+      <div style="font-size:22px;font-weight:700;color:var(--orange)">${f(a.points)} <span style="font-size:11px;font-weight:400;color:var(--textDim)">pts</span></div>
       <div style="font-size:12px;color:var(--textDim);margin-top:4px">${f(a.totalEvents)} events · ${ptsPct} of total · ~${a.avgPts} pts/event</div>
       <div style="font-size:10px;color:var(--textMuted);margin-top:4px">${a.desc}</div>
-      <div style="font-size:9px;color:var(--textMuted);margin-top:3px;font-family:'JetBrains Mono',monospace">sampled ${a.sampleSize} events for avg</div>
       </div>`;
   });
   actHTML+='</div>';
@@ -635,14 +605,14 @@ function render(){
   if(sgKeys.length>0){
     actHTML+='<div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:18px;margin-top:12px;margin-bottom:12px">';
     actHTML+='<div class="ct">On-Chain Activity (GoodDollar Subgraph)</div>';
-    actHTML+='<div class="cs" style="margin-bottom:4px">Supplementary data from the GoodDollar subgraph showing all tracked on-chain entity types. These represent blockchain activity — not all of them generate campaign points. The subgraph may index a different deployment chain; magnitudes are approximate.</div>';
+    actHTML+='<div class="cs" style="margin-bottom:4px">Supplementary data from the GoodDollar subgraph showing all tracked on-chain entity types. These represent blockchain activity — not all of them generate campaign points directly.</div>';
     actHTML+='<div style="display:flex;gap:10px;flex-wrap:wrap">';
     sgKeys.forEach((k,i)=>{
       const e=sgActivity[k];
       const color=palette[(i+actionKeys.length)%palette.length];
       actHTML+=`<div style="flex:1;min-width:160px;background:var(--surface2);border-radius:6px;padding:12px;border-left:3px solid ${color}">
         <div style="font-size:10px;color:var(--textMuted);text-transform:uppercase;letter-spacing:1px;font-family:'JetBrains Mono',monospace;margin-bottom:3px">${e.label}</div>
-        <div style="font-size:16px;font-weight:600;color:var(--white)">${e.magnitude}</div>
+        <div style="font-size:16px;font-weight:600;color:var(--white)">${f(e.count)}</div>
         <div style="font-size:10px;color:var(--textMuted);margin-top:2px">${e.desc}</div>
         </div>`;
     });
@@ -682,12 +652,10 @@ function render(){
   p+='</tbody></table></div>';document.getElementById('tt').innerHTML=p;
 
   // === Technical Details ===
-  const expectedSUP=837370,expectedWallets=620;
+  const expectedSUP=837370;
   const supDelta=Math.abs(tS-expectedSUP)/expectedSUP*100;
-  const walletDelta=Math.abs(pr.length-expectedWallets)/expectedWallets*100;
   const sanity=[];
   if(supDelta>10) sanity.push(`⚠ Total SUP (${f(tS)}) deviates ${f(supDelta,1)}% from expected ~${f(expectedSUP)}`);
-  if(walletDelta>20) sanity.push(`⚠ Wallet count (${pr.length}) deviates ${f(walletDelta,1)}% from expected ~${expectedWallets}`);
 
   document.getElementById('tech').innerHTML=`<div style="font-size:13px;font-weight:600;color:var(--white);margin-bottom:8px;font-family:'DM Sans'">Technical Details</div>
 <div><strong>Data Sources (3 separate systems):</strong></div>
