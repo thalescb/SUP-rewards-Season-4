@@ -97,7 +97,7 @@ const SG = "https://subgraph-endpoints.superfluid.dev/base-mainnet/protocol-v1";
 const PA = "https://cms.superfluid.pro/points/accounts";
 // Pool address and campaign ID
 const PID = "0x41491a100847a7f678e3b286fea32b0dad18920e";
-const CID = 7856;
+const CID = 7860;
 const W = 1e18;
 // Base Mainnet RPCs for on-chain owner() resolution
 const BASE_RPCS = ["https://mainnet.base.org","https://base.llamarpc.com","https://1rpc.io/base"];
@@ -220,7 +220,7 @@ async function go(){
       const ud=document.createElement('div');
       ud.style.cssText='margin:10px 0 0 30px';
       ud.innerHTML=`<div style="font-size:11px;color:var(--textDim);margin-bottom:6px">Run in PowerShell first:</div>
-        <pre style="background:var(--surface);padding:8px;border-radius:4px;font-size:9px;color:var(--orange);overflow:auto;margin-bottom:8px;max-height:60px;white-space:pre-wrap;word-break:break-all;user-select:all;cursor:text">$all=@();$p=1;do{$r=Invoke-RestMethod "https://cms.superfluid.pro/points/accounts?campaignId=7856&limit=100&page=$p";$all+=$r.accounts;$p++}while($r.pagination.hasNextPage);$all|ConvertTo-Json -Depth 5|Out-File "$env:USERPROFILE\\Desktop\\points_data.json" -Encoding UTF8</pre>
+        <pre style="background:var(--surface);padding:8px;border-radius:4px;font-size:9px;color:var(--orange);overflow:auto;margin-bottom:8px;max-height:60px;white-space:pre-wrap;word-break:break-all;user-select:all;cursor:text">$all=@();$p=1;do{$r=Invoke-RestMethod "https://cms.superfluid.pro/points/accounts?campaignId=7860&limit=100&page=$p";$all+=$r.accounts;$p++}while($r.pagination.hasNextPage);$all|ConvertTo-Json -Depth 5|Out-File "$env:USERPROFILE\\Desktop\\points_data.json" -Encoding UTF8</pre>
         <label style="display:inline-flex;align-items:center;gap:6px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 16px;cursor:pointer;font-size:12px;color:var(--textDim)">📁 Upload points_data.json<input type="file" accept=".json" id="pts-upload" style="display:none"></label>
         <span id="pts-status" style="margin-left:8px;font-size:12px"></span>`;
       document.getElementById('steps').appendChild(ud);
