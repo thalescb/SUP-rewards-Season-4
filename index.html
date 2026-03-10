@@ -68,7 +68,7 @@ td{padding:8px 10px;border-bottom:1px solid #21262d33}
       <div class="step" id="s3"><span class="ico">○</span> Points leaderboard</div>
       <div class="step" id="s4"><span class="ico">○</span> SUP token price</div>
       <div class="step" id="s5"><span class="ico">○</span> Activity timeline</div>
-      <div class="step" id="s6"><span class="ico">○</span> Action breakdown</div>
+      <div class="step" id="s6"><span class="ico">○</span> Action breakdown (subgraph + points)</div>
       <div class="step" id="s7"><span class="ico">○</span> Wallet↔Locker mapping</div>
     </div>
     <div id="ebox" style="display:none;margin-top:20px;background:var(--surface);border:1px solid var(--red);border-radius:8px;padding:14px;text-align:left">
@@ -93,10 +93,38 @@ td{padding:8px 10px;border-bottom:1px solid #21262d33}
 const W=1e18,PID="0x41491a100847a7f678e3b286fea32b0dad18920e",SG="https://subgraph-endpoints.superfluid.dev/base-mainnet/protocol-v1",PA="https://cms.superfluid.pro/points/accounts",CID=7856;
 const BASE_RPCS=["https://mainnet.base.org","https://base.llamarpc.com","https://1rpc.io/base"];
 const OWNER_SEL="0x8da5cb5b",LOCKER_OWNER_SEL="0xa80b4694"; // owner() and lockerOwner() selectors
+// GoodDollar locker/rewards subgraph — Base chain (NOT Arbitrum)
+const GD_SG="https://api.thegraph.com/subgraphs/id/QmbmxtkSiFkKpHeUd4wKmws8QVkb7DtE2UMRtezC7HpmG1";
 let pool,mem=[],pts=[],price=null,tl=[],actions={},lockers={};
 
 function ms(id,st){const e=document.getElementById(id);e.className='step '+st;e.querySelector('.ico').textContent=st==='done'?'✓':st==='active'?'◉':st==='fail'?'✗':'○';}
 async function gql(q){const r=await fetch(SG,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q})});if(!r.ok)throw new Error('Subgraph HTTP '+r.status);return(await r.json()).data;}
+
+// Query the GoodDollar subgraph (with CORS proxy fallback)
+async function gdGql(query){
+  const endpoints=[GD_SG, GD_SG+'/graphql'];
+  for(const ep of endpoints){
+    // Try direct POST
+    try{const r=await fetch(ep,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query})});if(r.ok){const j=await r.json();if(j.data)return j.data;}}catch(e){}
+    // Try via CORS proxy
+    try{const r=await fetch('https://corsproxy.io/?url='+encodeURIComponent(ep),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query})});if(r.ok){const j=await r.json();if(j.data)return j.data;}}catch(e){}
+  }
+  return null;
+}
+
+// Paginate a GoodDollar subgraph entity to count all records
+async function gdCount(entityName){
+  let total=0,lastId='';
+  while(true){
+    const w=lastId?`(first:1000,orderBy:id,where:{id_gt:"${lastId}"})`:`(first:1000,orderBy:id)`;
+    const d=await gdGql(`{${entityName}${w}{id}}`);
+    if(!d||!d[entityName]||!d[entityName].length)break;
+    total+=d[entityName].length;
+    if(d[entityName].length<1000)break;
+    lastId=d[entityName][d[entityName].length-1].id;
+  }
+  return total;
+}
 
 async function go(){
   try{
@@ -165,12 +193,48 @@ async function go(){
     if(!d.memberUnitsUpdatedEvents||!d.memberUnitsUpdatedEvents.length)break;tl=tl.concat(d.memberUnitsUpdatedEvents);if(d.memberUnitsUpdatedEvents.length<1000)break;tlid=d.memberUnitsUpdatedEvents[d.memberUnitsUpdatedEvents.length-1].id;}}catch(e){}
     ms('s5','done');
 
-    // Step 6: Action breakdown - discover real event names from events API
+    // Step 6: Action breakdown — query GoodDollar subgraph (Base) + Points API
     ms('s6','active');
-    // Fetch events to discover actual eventName values and aggregate
+
+    // Part A: Discover all entity types in the GoodDollar subgraph via introspection-like probe
+    const entityDefs=[
+      {key:'stakingEvents',label:'Governance Staking',desc:'Staking events in GoodDollar governance',source:'subgraph'},
+      {key:'lockerStakings',label:'Locker Staking',desc:'Active staking positions per locker',source:'subgraph'},
+      {key:'fontaines',label:'Fontaine Streaming',desc:'Fontaine streaming donation contracts',source:'subgraph'},
+      {key:'instantUnlocks',label:'Instant Unlocks',desc:'Instant token unlock events',source:'subgraph'},
+      {key:'claimEventUnits',label:'G$ Claims',desc:'Daily G$ UBI claim unit events',source:'subgraph'},
+      {key:'fluidStreamClaimEvents',label:'Stream Claims',desc:'Superfluid stream claim events',source:'subgraph'},
+      {key:'liquidityPositions',label:'Liquidity Positions',desc:'Liquidity provision positions',source:'subgraph'}
+    ];
+
+    // Probe which entities exist (single combined query)
+    let gdOk=false;
+    try{
+      const disc=await gdGql(`{se:stakingEvents(first:1){id} ls:lockerStakings(first:1){id} fn:fontaines(first:1){id} iu:instantUnlocks(first:1){id} ce:claimEventUnits(first:1){id} fs:fluidStreamClaimEvents(first:1){id} lp:liquidityPositions(first:1){id}}`);
+      if(disc){
+        const alias2key={se:'stakingEvents',ls:'lockerStakings',fn:'fontaines',iu:'instantUnlocks',ce:'claimEventUnits',fs:'fluidStreamClaimEvents',lp:'liquidityPositions'};
+        const existing=new Set();
+        for(const [alias,key] of Object.entries(alias2key)){
+          if(disc[alias]&&disc[alias].length>0) existing.add(key);
+        }
+        // Count each existing entity by paginating
+        for(const ent of entityDefs){
+          if(existing.has(ent.key)){
+            try{ent.count=await gdCount(ent.key);}catch(e){ent.count=0;}
+          } else {
+            ent.count=0;
+          }
+          const found=entityDefs.filter(e=>e.count>0).length;
+          document.getElementById('s6').querySelector('.ico').textContent=found+' types';
+        }
+        gdOk=true;
+      }
+    }catch(e){console.warn('GoodDollar subgraph probe failed:',e);}
+
+    // Part B: Also query Points API events (full pagination) to get point values per event type
     const evAgg={};// eventName → {count, totalPts}
-    let evPage=1;const evSamplePages=5;// fetch 5 pages of 100 to get good sample
-    for(let ep=1;ep<=evSamplePages;ep++){
+    let evPagesMax=50;// up to 5000 events sampled
+    for(let ep=1;ep<=evPagesMax;ep++){
       let got=false;
       for(const px of [null,'https://corsproxy.io/?url=','https://api.allorigins.win/raw?url=']){
         try{
@@ -178,19 +242,20 @@ async function go(){
           const r=await fetch(px?px+encodeURIComponent(url):url);
           if(!r.ok) continue;
           const j=await r.json();
-          if(!j.events||!j.events.length) break;
+          if(!j.events||!j.events.length){got=true;break;}
           j.events.forEach(e=>{
             const n=e.eventName||'unknown';
-            if(!evAgg[n]) evAgg[n]={count:0,samplePts:0,totalDocs:j.pagination?j.pagination.totalDocs:0};
-            evAgg[n].count++;evAgg[n].samplePts+=(e.points||0);
+            if(!evAgg[n]) evAgg[n]={count:0,totalPts:0};
+            evAgg[n].count++;evAgg[n].totalPts+=(e.points||0);
           });
-          got=true;break;
+          got=true;
+          if(!j.pagination||!j.pagination.hasNextPage){evPagesMax=0;}// stop after this
+          break;
         }catch(e){continue;}
       }
       if(!got) break;
-      document.getElementById('s6').querySelector('.ico').textContent=Object.keys(evAgg).length+' types';
     }
-    // Now for each discovered event type, get totalDocs via filtered query
+    // For each Points API event type, also get exact totalDocs via filtered query
     for(const evName of Object.keys(evAgg)){
       for(const px of [null,'https://corsproxy.io/?url=','https://api.allorigins.win/raw?url=']){
         try{
@@ -200,18 +265,51 @@ async function go(){
           const j=await r.json();
           if(j.pagination){
             evAgg[evName].totalDocs=j.pagination.totalDocs;
-            // Estimate total points: (samplePts/sampleCount) * totalDocs
             if(evAgg[evName].count>0){
-              evAgg[evName].estPts=Math.round(evAgg[evName].samplePts/evAgg[evName].count*j.pagination.totalDocs);
+              evAgg[evName].estPts=Math.round(evAgg[evName].totalPts/evAgg[evName].count*j.pagination.totalDocs);
             }
           }
           break;
         }catch(e){continue;}
       }
     }
-    // Store as actions for rendering
-    Object.entries(evAgg).forEach(([name,data])=>{
-      actions[name]={points:data.estPts||data.samplePts,totalEvents:data.totalDocs||data.count,estimated:!!(data.estPts)};
+
+    // Part C: Merge subgraph entities + Points API events into unified actions map
+    // First add subgraph entities
+    entityDefs.forEach(ent=>{
+      if(ent.count>0){
+        actions[ent.key]={
+          label:ent.label, desc:ent.desc, source:'subgraph',
+          totalEvents:ent.count, points:0, estimated:false
+        };
+      }
+    });
+    // Overlay Points API data (map Points API eventNames to subgraph entity keys)
+    const ptsToSgMap={
+      'governanceStakePoints':'stakingEvents',
+      'claimPoints':'claimEventUnits', 'claimed':'claimEventUnits',
+      'streamPoints':'fluidStreamClaimEvents', 'streamed':'fluidStreamClaimEvents',
+      'invitePoints':null, 'invites':null // no direct subgraph mapping
+    };
+    Object.entries(evAgg).forEach(([evName,data])=>{
+      const sgKey=ptsToSgMap[evName];
+      const pts=data.estPts||data.totalPts;
+      const evCount=data.totalDocs||data.count;
+      if(sgKey&&actions[sgKey]){
+        // Merge into existing subgraph entity
+        actions[sgKey].points=pts;
+        actions[sgKey].estimated=!!(data.estPts);
+        actions[sgKey].ptsEventName=evName;
+        // Use Points API count if subgraph count is 0
+        if(!actions[sgKey].totalEvents) actions[sgKey].totalEvents=evCount;
+      } else if(!sgKey||!actions[sgKey]){
+        // Points API event with no subgraph equivalent — add as separate action
+        actions[evName]={
+          label:evName.replace(/([A-Z])/g,' $1').replace(/^./,s=>s.toUpperCase()),
+          desc:'Points event from campaign API', source:'points-api',
+          totalEvents:evCount, points:pts, estimated:!!(data.estPts), ptsEventName:evName
+        };
+      }
     });
     ms('s6','done');
 
@@ -432,30 +530,53 @@ function render(){
   const pm={};tr.forEach(r=>{if(r.l){const d=r.l.slice(0,10);pm[d]=(pm[d]||0)+1;}});const pds=Object.keys(pm).sort();line('t2',pds,pds.map(d=>pm[d]),'#58a6ff');
 
   // Tables
-  // Actions breakdown section - dynamically from discovered event types
-  const evLabels={governanceStakePoints:'Governance Staking',claimed:'Claiming G$',invites:'Inviting Users',streamed:'Streaming Donations',claimPoints:'Claiming G$',invitePoints:'Invite Rewards',streamPoints:'Stream Donations'};
-  const evDescs={governanceStakePoints:'Staking in GoodDollar governance',claimed:'Daily G$ claims from GoodDollar UBI',invites:'Referring new users to the ecosystem',streamed:'Streaming or one-time donations to GoodCollective',claimPoints:'Daily G$ claims from GoodDollar UBI',invitePoints:'Referring new users to the ecosystem',streamPoints:'Streaming donations to GoodCollective'};
+  // Actions breakdown section — uses merged subgraph + Points API data with donut chart
   const palette=['#3fb950','#58a6ff','#bc8cff','#f778ba','#d29922','#f85149','#79c0ff','#7ee787'];
-  const actionKeys=Object.keys(actions).sort((a,b)=>(actions[b].points||0)-(actions[a].points||0));
-  const actTotal=actionKeys.reduce((s,k)=>s+(typeof actions[k].points==='number'?actions[k].points:0),0);
-  let actHTML='<div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:18px;margin-bottom:12px"><div class="ct">Points by Action Type</div><div class="cs">Points are earned through on-chain actions. Each action type generates events that accumulate into a user\'s total points, which determine their share of SUP rewards.</div>';
-  actHTML+='<div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px">';
+  const actionKeys=Object.keys(actions).sort((a,b)=>(actions[b].totalEvents||0)-(actions[a].totalEvents||0));
+  const actTotalPts=actionKeys.reduce((s,k)=>s+(typeof actions[k].points==='number'?actions[k].points:0),0);
+  const actTotalEv=actionKeys.reduce((s,k)=>s+(actions[k].totalEvents||0),0);
+
+  let actHTML='<div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:18px;margin-bottom:12px">';
+  actHTML+='<div class="ct">On-Chain Actions &amp; Points Breakdown</div>';
+  actHTML+='<div class="cs">All on-chain action types from the GoodDollar subgraph (Base Mainnet) merged with points data from the Superfluid Points API. Actions without point values are tracked on-chain but may not generate campaign points directly.</div>';
+
+  // Donut chart + legend layout
+  actHTML+='<div style="display:flex;gap:24px;flex-wrap:wrap;align-items:center;margin:16px 0">';
+  actHTML+='<div style="flex:0 0 220px;position:relative"><canvas id="donutActions" width="220" height="220"></canvas>';
+  actHTML+='<div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center"><div style="font-size:22px;font-weight:700;color:var(--white)">'+f(actTotalEv)+'</div><div style="font-size:10px;color:var(--textMuted)">total events</div></div></div>';
+  actHTML+='<div style="flex:1;min-width:240px">';
   actionKeys.forEach((ev,i)=>{
     const a=actions[ev];
-    const pct=actTotal>0&&typeof a.points==='number'?f(a.points/actTotal*100,1)+'%':'—';
-    const label=evLabels[ev]||ev.replace(/([A-Z])/g,' $1').replace(/^./,s=>s.toUpperCase());
-    const desc=evDescs[ev]||'';
     const color=palette[i%palette.length];
+    const evPct=actTotalEv>0?(a.totalEvents/actTotalEv*100):0;
+    actHTML+=`<div style="display:flex;align-items:center;gap:8px;padding:4px 0"><div style="width:10px;height:10px;border-radius:2px;background:${color};flex-shrink:0"></div><div style="font-size:12px;color:var(--text);flex:1">${a.label||ev}</div><div style="font-size:11px;color:var(--textDim);font-family:'JetBrains Mono',monospace;white-space:nowrap">${f(a.totalEvents||0)} (${f(evPct,1)}%)</div></div>`;
+  });
+  actHTML+='</div></div>';
+
+  // Detail cards
+  actHTML+='<div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:8px">';
+  actionKeys.forEach((ev,i)=>{
+    const a=actions[ev];
+    const color=palette[i%palette.length];
+    const ptsPct=actTotalPts>0&&typeof a.points==='number'?f(a.points/actTotalPts*100,1)+'%':'—';
+    const srcBadge=a.source==='subgraph'?'<span style="font-size:9px;background:#161b22;color:#58a6ff;padding:1px 5px;border-radius:3px;margin-left:4px">subgraph</span>':'<span style="font-size:9px;background:#161b22;color:#d29922;padding:1px 5px;border-radius:3px;margin-left:4px">points API</span>';
     actHTML+=`<div style="flex:1;min-width:180px;background:var(--surface2);border-radius:8px;padding:14px;border-left:3px solid ${color}">
-      <div style="font-size:10px;color:var(--textMuted);text-transform:uppercase;letter-spacing:1px;font-family:'JetBrains Mono',monospace;margin-bottom:4px">${label}</div>
-      <div style="font-size:20px;font-weight:700;color:var(--white)">${typeof a.points==='number'&&a.points>0?f(a.points)+(a.estimated?' (est.)':''):'N/A'} pts</div>
-      <div style="font-size:11px;color:var(--textDim);margin-top:2px">${pct} of total${a.totalEvents?' · '+f(a.totalEvents)+' events':''}</div>
-      ${desc?'<div style="font-size:10px;color:var(--textMuted);margin-top:4px">'+desc+'</div>':''}
+      <div style="font-size:10px;color:var(--textMuted);text-transform:uppercase;letter-spacing:1px;font-family:'JetBrains Mono',monospace;margin-bottom:4px">${a.label||ev}${srcBadge}</div>
+      <div style="font-size:18px;font-weight:700;color:var(--white)">${f(a.totalEvents||0)} <span style="font-size:11px;color:var(--textDim);font-weight:400">events</span></div>
+      <div style="font-size:12px;color:var(--orange);margin-top:2px">${typeof a.points==='number'&&a.points>0?f(a.points)+(a.estimated?' (est.)':'')+' pts · '+ptsPct:'No point data'}</div>
+      ${a.desc?'<div style="font-size:10px;color:var(--textMuted);margin-top:4px">'+a.desc+'</div>':''}
       </div>`;
   });
-  actHTML+='</div>';
-  actHTML+='</div>';
+  actHTML+='</div></div>';
   document.getElementById('actions-section').innerHTML=actHTML;
+
+  // Render the donut chart
+  if(actionKeys.length>0&&document.getElementById('donutActions')){
+    new Chart(document.getElementById('donutActions'),{type:'doughnut',data:{
+      labels:actionKeys.map(k=>actions[k].label||k),
+      datasets:[{data:actionKeys.map(k=>actions[k].totalEvents||0),backgroundColor:actionKeys.map((_,i)=>palette[i%palette.length]+'cc'),borderColor:actionKeys.map((_,i)=>palette[i%palette.length]),borderWidth:1,hoverOffset:6}]
+    },options:{responsive:false,cutout:'65%',plugins:{legend:{display:false},tooltip:{callbacks:{label:function(ctx){const k=actionKeys[ctx.dataIndex];const a=actions[k];return` ${a.label||k}: ${f(a.totalEvents)} events`+(a.points?` · ${f(a.points)} pts`:'');}}}}}});
+  }
 
   const maxSUP=pr.length?pr[0].s:1;
   let h='<div style="overflow-x:auto"><table><thead><tr><th>#</th><th>Wallet</th><th>Locker</th><th>SUP Received</th><th>Points</th><th>Units</th><th>Share</th></tr></thead><tbody>';
