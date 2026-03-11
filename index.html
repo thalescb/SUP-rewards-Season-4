@@ -281,9 +281,22 @@ async function go(){
     }
 
     // Build actions map from exact Points API data
-    const evLabels={governanceStakePoints:'Governance Staking',claimPoints:'G$ Claims',claimed:'G$ Claims',streamPoints:'Stream Donations',streamed:'Stream Donations',invitePoints:'Invite Rewards',invites:'Invite Rewards',farcasterPoints:'Farcaster Activity'};
-    const evDescs={governanceStakePoints:'Staking G$ in GoodDollar governance',claimPoints:'Daily G$ UBI claims',claimed:'Daily G$ UBI claims',streamPoints:'Streaming donations to GoodCollective',streamed:'Streaming donations to GoodCollective',invitePoints:'Referring new users to the ecosystem',invites:'Referring new users',farcasterPoints:'Engagement on Farcaster social protocol'};
+    // Exclude system/internal events
+    const EXCLUDE_EVENTS=new Set(['stack_sync','superfluid-program-bootstrapper']);
+    // Merge invite event types into single category
+    const MERGE_MAP={'inviteRewards':'invites','validInvites':'invites'};
+    // Apply exclusions and merges
+    const merged={};
     Object.entries(evTypes).forEach(([name,t])=>{
+      if(EXCLUDE_EVENTS.has(name)) return;
+      const key=MERGE_MAP[name]||name;
+      if(!merged[key]) merged[key]={totalEvents:0,totalPts:0};
+      merged[key].totalEvents+=t.totalEvents;
+      merged[key].totalPts+=t.totalPts;
+    });
+    const evLabels={governanceStakePoints:'Governance Staking',claimPoints:'G$ Claims',claimed:'G$ Claims',streamPoints:'Stream Donations',streamed:'Stream Donations',invites:'Invites',farcasterPoints:'Farcaster Activity'};
+    const evDescs={governanceStakePoints:'Staking G$ in GoodDollar governance',claimPoints:'Daily G$ UBI claims',claimed:'Daily G$ UBI claims',streamPoints:'Streaming donations to GoodCollective',streamed:'Streaming donations to GoodCollective',invites:'Inviting new users to the ecosystem',farcasterPoints:'Engagement on Farcaster social protocol'};
+    Object.entries(merged).forEach(([name,t])=>{
       const avgPts=t.totalEvents>0?t.totalPts/t.totalEvents:0;
       actions[name]={
         label:evLabels[name]||name.replace(/([A-Z])/g,' $1').replace(/^./,s=>s.toUpperCase()),
@@ -618,16 +631,6 @@ function render(){
     });
     actHTML+='</div></div>';
   }
-
-  // === Missing Actions Note ===
-  actHTML+='<div style="background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--purple);border-radius:10px;padding:14px 18px;margin-top:12px;margin-bottom:12px;font-size:11px;line-height:1.6;color:var(--textDim)">';
-  actHTML+='<strong style="color:var(--text)">About missing actions (invites, claims, etc.):</strong> ';
-  actHTML+='The Points API for campaign #'+CID+' only returns the event types shown above. If you expected additional actions like <em>invites</em>, <em>G$ claims</em>, or <em>streaming donations</em>, there are a few possible explanations: ';
-  actHTML+='(1) These actions may not award points in this specific campaign configuration. ';
-  actHTML+='(2) They may be tracked under different event names — the event types above are exactly what the API returns. ';
-  actHTML+='(3) The campaign may have been configured to only reward staking and specific other activities. ';
-  actHTML+='The GoodDollar team can confirm which actions were enabled for Season 4 in the campaign settings.';
-  actHTML+='</div>';
 
   document.getElementById('actions-section').innerHTML=actHTML;
 
