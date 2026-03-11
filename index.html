@@ -79,7 +79,7 @@ td{padding:8px 10px;border-bottom:1px solid #21262d33}
   </div>
 </div>
 <div class="report" id="rpt" style="display:none">
-  <div class="header"><div><h1>⚡ Season 4 SUP Rewards</h1><div class="sub mono">GoodDollar Incentives · Base Mainnet · Dec 17 2025 → Feb 26 2026</div></div><div class="export-bar"><button class="bx" onclick="xPool()">⬇ Pool CSV</button><button class="bx" onclick="xPts()">⬇ Points CSV</button><button class="bx" onclick="xSum()">⬇ Summary</button></div></div>
+  <div class="header"><div><h1>⚡ Season 4 SUP Rewards</h1><div class="sub mono">GoodDollar Incentives · Base Mainnet · Dec 17 2025 → Feb 26 2026</div></div><div class="export-bar"><button class="bx" onclick="xPool()">⬇ Pool CSV</button><button class="bx" onclick="xPts()">⬇ Points CSV</button><button class="bx" onclick="xSum()">⬇ Summary</button><button class="bx" onclick="xSnap()" title="Download snapshot.json — commit to data/ folder for instant loading">⬇ Snapshot</button><button class="bx" onclick="refreshLive()" id="refreshBtn" style="color:var(--orange);border-color:var(--orange)" title="Re-fetch all data live from blockchain and APIs">↻ Refresh Live</button></div></div>
   <div class="banner" id="banner"><strong>ℹ️ Loading data...</strong> Fetching pool distribution, points, and wallet mapping from multiple sources.</div>
   <div class="kg" id="k1"></div><div class="kg" id="k2"></div>
   <div id="actions-section"></div>
@@ -118,6 +118,67 @@ const GD_SG = "https://api.thegraph.com/subgraphs/id/QmbmxtkSiFkKpHeUd4wKmws8QVk
 let pool, mem=[], pts=[], price=null, tl=[], actions={}, lockers={};
 let sgActivity={};      // GD subgraph entity existence (supplementary context)
 let resolveStats={};    // How wallet resolution happened
+let snapshotTime=null;  // If loaded from cache, the timestamp of the snapshot
+
+/* ===== SNAPSHOT (cached data for instant load) ===== */
+
+// Try to load pre-built snapshot from data/snapshot.json
+async function loadSnapshot(){
+  try{
+    const r=await fetch('data/snapshot.json');
+    if(!r.ok) return false;
+    const snap=await r.json();
+    pool=snap.pool; mem=snap.mem; pts=snap.pts; price=snap.price;
+    tl=snap.tl||[]; actions=snap.actions||{}; sgActivity=snap.sgActivity||{};
+    lockers=snap.lockers||{}; resolveStats=snap.resolveStats||{};
+    snapshotTime=snap.generated_at||null;
+    return true;
+  }catch(e){return false;}
+}
+
+// Build a snapshot object from current state (only relevant data, trimmed for size)
+function buildSnapshot(){
+  // Filter lockers to only entries relevant to pool members or points accounts
+  const poolAddrs=new Set(mem.map(m=>m.account.id.toLowerCase()));
+  const ptsAddrs=new Set(pts.map(p=>p.account.toLowerCase()));
+  const filteredLockers={};
+  Object.entries(lockers).forEach(([k,v])=>{
+    if(poolAddrs.has(k)||ptsAddrs.has(v)) filteredLockers[k]=v;
+  });
+  // Trim timeline to just timestamps (all render needs)
+  const trimmedTl=tl.map(e=>({id:e.id,timestamp:e.timestamp}));
+  return {
+    generated_at:new Date().toISOString(),
+    pool, mem, pts, price,
+    tl:trimmedTl, actions, sgActivity,
+    lockers:filteredLockers, resolveStats
+  };
+}
+
+// Download snapshot as JSON file (user commits to repo as data/snapshot.json)
+function xSnap(){
+  const snap=buildSnapshot();
+  const json=JSON.stringify(snap);
+  const b=new Blob([json],{type:'application/json'});
+  const u=URL.createObjectURL(b);
+  const a=document.createElement('a');
+  a.href=u;a.download='snapshot.json';a.click();
+  URL.revokeObjectURL(u);
+}
+
+// Entry point: try snapshot first, fall back to live pipeline
+async function init(){
+  const cached=await loadSnapshot();
+  if(cached){
+    // Instant render from cached data
+    document.getElementById('ov').style.display='none';
+    document.getElementById('rpt').style.display='block';
+    render();
+  }else{
+    // No snapshot found — run live data pipeline
+    go();
+  }
+}
 
 /* ===== HELPERS ===== */
 function ms(id,st){const e=document.getElementById(id);e.className='step '+st;e.querySelector('.ico').textContent=st==='done'?'✓':st==='active'?'◉':st==='fail'?'✗':'○';}
@@ -533,6 +594,14 @@ function render(){
     document.getElementById('banner').style.borderLeftColor='var(--accent)';
   }
 
+  // === Snapshot Notice ===
+  if(snapshotTime){
+    const st=new Date(snapshotTime);
+    const age=Math.round((Date.now()-st.getTime())/3600000);
+    const ageStr=age<1?'less than an hour':age<24?age+'h':Math.round(age/24)+'d';
+    document.getElementById('banner').innerHTML+=`<div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border);font-size:11px;color:var(--textMuted)">📸 <strong style="color:var(--text)">Cached snapshot</strong> from ${st.toISOString().slice(0,16).replace('T',' ')} UTC (${ageStr} ago). Click <strong style="color:var(--orange)">↻ Refresh Live</strong> above for latest on-chain data. Use <strong>⬇ Snapshot</strong> after refresh to update the cache.</div>`;
+  }
+
   // === KPI Row 2 ===
   document.getElementById('k2').innerHTML=`
     <div class="k g"><div class="kl">Average Reward</div><div class="kv">${f(tS/pr.length,2)} SUP</div><div class="ku">${usd(tS/pr.length)}</div></div>
@@ -681,7 +750,13 @@ function render(){
 <div>  → ${f(matched)} matched to points accounts (${f(matched/pr.length*100,1)}%)</div>
 ${sanity.length?'<div style="color:var(--orange);margin-top:6px">'+sanity.join('<br>')+'</div>':''}`;
 
-  document.getElementById('ft').textContent=`Generated ${new Date().toISOString().slice(0,16).replace('T',' ')} UTC · Live data from Superfluid Subgraph + Points API + GoodDollar Subgraph`;
+  if(snapshotTime){
+    const st=new Date(snapshotTime);
+    const age=Math.round((Date.now()-st.getTime())/3600000);
+    document.getElementById('ft').textContent=`Data snapshot: ${st.toISOString().slice(0,16).replace('T',' ')} UTC (${age}h ago) · Click "↻ Refresh Live" for latest data`;
+  }else{
+    document.getElementById('ft').textContent=`Generated ${new Date().toISOString().slice(0,16).replace('T',' ')} UTC · Live data from Superfluid Subgraph + Points API + GoodDollar Subgraph`;
+  }
   window._pr=pr;window._tr=tr;window._tS=tS;window._tF=tF;window._st={tS,tF,m:pr.length,cn,pa:tr.length,tP,avg:tS/pr.length,med,t10p:t10/tS*100,g,u:Number(pool.totalUnits),price,matched,lkCount:Object.keys(lockers).length,resolveStats};
 }
 
@@ -699,7 +774,33 @@ function xPool(){dl(csv(window._pr.map((r,i)=>({rank:i+1,wallet:r.wallet||'',loc
 function xPts(){dl(csv(window._tr.map((r,i)=>({rank:i+1,wallet:r.a,points:r.p,events:r.e,last:r.l||''})),['rank','wallet','points','events','last']),'season4_points.csv');}
 function xSum(){const s=window._st;dl(csv([{m:'Total Funding (SUP)',v:Math.round(s.tF*100)/100},{m:'Total Distributed (SUP)',v:Math.round(s.tS*100)/100},{m:'SUP Price (USD)',v:s.price||'N/A'},{m:'Total Value (USD)',v:s.price?Math.round(s.tS*s.price*100)/100:'N/A'},{m:'Pool Members',v:s.m},{m:'Connected',v:s.cn},{m:'Points Participants',v:s.pa},{m:'Matched (Pool↔Points)',v:s.matched},{m:'Lockers Indexed',v:s.lkCount},{m:'Total Points',v:s.tP},{m:'Total Units',v:s.u},{m:'Average (SUP)',v:Math.round(s.avg*100)/100},{m:'Median (SUP)',v:Math.round(s.med*100)/100},{m:'Top 10 %',v:Math.round(s.t10p*100)/100},{m:'Gini',v:Math.round(s.g*1000)/1000},{m:'Token',v:'SUP'},{m:'Pool',v:PID},{m:'Network',v:'Base Mainnet'},{m:'Campaign',v:'#'+CID}],['m','v']),'season4_summary.csv');}
 
-window.addEventListener('DOMContentLoaded',go);
+// Refresh: reset state and re-run live pipeline
+async function refreshLive(){
+  if(!confirm('This will re-fetch all data live from the blockchain and APIs.\nThis takes ~10 minutes. Continue?')) return;
+  // Reset state
+  pool=undefined;mem=[];pts=[];price=null;tl=[];actions={};lockers={};sgActivity={};resolveStats={};snapshotTime=null;
+  // Destroy existing charts
+  Object.values(Chart.instances||{}).forEach(c=>{try{c.destroy();}catch(e){}});
+  // Show overlay, hide report
+  document.getElementById('rpt').style.display='none';
+  const ov=document.getElementById('ov');
+  ov.style.display='flex';ov.classList.remove('fade-out');ov.style.opacity='1';
+  document.getElementById('ring').style.display='';
+  document.getElementById('ovt').textContent='Refreshing Live Data';
+  document.getElementById('ovs').textContent='Re-fetching from blockchain and APIs…';
+  document.getElementById('ebox').style.display='none';
+  // Reset step indicators
+  for(let i=1;i<=7;i++){
+    const el=document.getElementById('s'+i);
+    if(el){el.className='step';el.querySelector('.ico').textContent='○';}
+  }
+  // Remove any dynamic upload widgets from prior runs
+  document.querySelectorAll('#steps > div:not(.step)').forEach(el=>el.remove());
+  // Run live pipeline
+  go();
+}
+
+window.addEventListener('DOMContentLoaded',init);
 </script>
 </body>
 </html>
