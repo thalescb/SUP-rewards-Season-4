@@ -1,0 +1,404 @@
+/* ==========================================================================
+   Google Fonts
+   ========================================================================== */
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+
+/* ==========================================================================
+   Design Tokens (CSS custom properties)
+   ========================================================================== */
+:root {
+  --bg:        #06090f;
+  --surface:   #0d1117;
+  --surface2:  #161b22;
+  --border:    #21262d;
+  --accent:    #58a6ff;
+  --green:     #3fb950;
+  --orange:    #d29922;
+  --red:       #f85149;
+  --purple:    #bc8cff;
+  --pink:      #f778ba;
+  --text:      #c9d1d9;
+  --textDim:   #8b949e;
+  --textMuted: #484f58;
+  --white:     #f0f6fc;
+}
+
+/* ==========================================================================
+   Reset & Base
+   ========================================================================== */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'DM Sans', sans-serif;
+  overflow-x: hidden;
+}
+
+.mono {
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* ==========================================================================
+   Loading Overlay
+   ========================================================================== */
+.overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: var(--bg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  transition: opacity .5s;
+}
+
+.overlay.fade-out {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Pulsing ring animation shown while data is loading */
+.pulse-ring {
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  position: relative;
+  margin: 0 auto 24px;
+}
+
+.pulse-ring::before,
+.pulse-ring::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 2px solid var(--accent);
+  animation: pr 1.5s ease-out infinite;
+}
+
+.pulse-ring::after {
+  animation-delay: .5s;
+}
+
+.pulse-ring .dot {
+  width: 12px;
+  height: 12px;
+  background: var(--accent);
+  border-radius: 50%;
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+}
+
+@keyframes pr {
+  0%   { transform: scale(.5);  opacity: 1; }
+  100% { transform: scale(1.8); opacity: 0; }
+}
+
+/* Pipeline step rows in the loading overlay */
+.step {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+  font-size: 13px;
+  color: var(--textDim);
+  transition: color .3s;
+}
+
+.step.active { color: var(--accent); }
+.step.done   { color: var(--green);  }
+.step.fail   { color: var(--red);    }
+
+.step .ico {
+  width: 20px;
+  text-align: center;
+}
+
+/* ==========================================================================
+   Report Layout
+   ========================================================================== */
+.report {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 40px 28px 80px;
+  opacity: 0;
+  animation: fi .6s ease forwards;
+}
+
+@keyframes fi { to { opacity: 1; } }
+
+/* Page header: title + export bar */
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 28px;
+  flex-wrap: wrap;
+  gap: 16px;
+}
+
+.header h1 {
+  font-size: 22px;
+  font-weight: 700;
+  color: var(--white);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.header .sub {
+  font-size: 12px;
+  color: var(--textDim);
+  margin-top: 4px;
+}
+
+/* Export / action buttons */
+.export-bar {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.bx {
+  background: var(--surface2);
+  color: var(--textDim);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 14px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: 'DM Sans', sans-serif;
+  transition: all .15s;
+}
+
+.bx:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* Informational banner below the header */
+.banner {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--orange);
+  border-radius: 8px;
+  padding: 14px 18px;
+  margin-bottom: 24px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--textDim);
+}
+
+.banner strong {
+  color: var(--text);
+}
+
+/* ==========================================================================
+   KPI Cards
+   ========================================================================== */
+/* Grid wrapper for a row of KPI cards */
+.kg {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+/* Individual card */
+.k {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 18px;
+  position: relative;
+  overflow: hidden;
+}
+
+/* Coloured top-border accent strip by variant */
+.k::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+}
+
+.k.g::before  { background: var(--green);  }
+.k.b::before  { background: var(--accent); }
+.k.o::before  { background: var(--orange); }
+.k.p::before  { background: var(--purple); }
+.k.pk::before { background: var(--pink);   }
+.k.r::before  { background: var(--red);    }
+
+/* Card sub-elements */
+.kl {
+  font-size: 10px;
+  color: var(--textMuted);
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  margin-bottom: 6px;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.kv {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--white);
+  line-height: 1.1;
+}
+
+.ks {
+  font-size: 11px;
+  color: var(--textDim);
+  margin-top: 4px;
+}
+
+.ku {
+  font-size: 10px;
+  color: var(--textMuted);
+  margin-top: 2px;
+  font-family: 'JetBrains Mono', monospace;
+  font-style: italic;
+}
+
+/* ==========================================================================
+   Chart Grid
+   ========================================================================== */
+.cg {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+@media (max-width: 800px) {
+  .cg { grid-template-columns: 1fr; }
+}
+
+/* Individual chart card */
+.cb {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 18px;
+}
+
+/* Chart card title / subtitle */
+.ct {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--white);
+  margin-bottom: 4px;
+}
+
+.cs {
+  font-size: 11px;
+  color: var(--textDim);
+  margin-bottom: 14px;
+}
+
+/* ==========================================================================
+   Table Section
+   ========================================================================== */
+.ts {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 18px;
+  margin-top: 12px;
+}
+
+/* Tab strip */
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 14px;
+}
+
+.tab {
+  padding: 7px 18px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  color: var(--textDim);
+  font-family: 'DM Sans', sans-serif;
+  font-weight: 500;
+  transition: all .15s;
+}
+
+.tab:hover { color: var(--text); }
+
+.tab.on {
+  background: var(--accent);
+  color: var(--bg);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+
+/* Data table */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+th {
+  text-align: left;
+  padding: 8px 10px;
+  color: var(--textMuted);
+  font-weight: 500;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: .5px;
+  font-family: 'JetBrains Mono', monospace;
+  border-bottom: 1px solid var(--border);
+}
+
+td {
+  padding: 8px 10px;
+  border-bottom: 1px solid #21262d33;
+}
+
+/* Address cells */
+.ad {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--accent);
+}
+
+/* ==========================================================================
+   Technical Details Block
+   ========================================================================== */
+.tech {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 18px;
+  margin-top: 12px;
+  font-size: 11px;
+  color: var(--textDim);
+  font-family: 'JetBrains Mono', monospace;
+  line-height: 1.9;
+}
+
+/* ==========================================================================
+   Footer
+   ========================================================================== */
+.footer {
+  text-align: center;
+  margin-top: 32px;
+  font-size: 11px;
+  color: var(--textMuted);
+}
